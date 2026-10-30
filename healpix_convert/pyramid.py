@@ -125,7 +125,11 @@ def write_derived_levels(
     dt = utils.open_datatrees(
         [output_store],
         chunks={},
-        storage_options=output_storage_options,
+        # a store object already holds its storage options: Zarr refuses them
+        # next to it (they are only used to open a URL)
+        storage_options=(
+            output_storage_options if isinstance(output_store, str) else None
+        ),
         consolidated=False,
     )[0]
 

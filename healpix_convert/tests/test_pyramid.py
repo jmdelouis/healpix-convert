@@ -271,13 +271,13 @@ def _settings(
     )
 
 
-def _generate_pyramids(cache, settings, path):
+def _generate_pyramids(cache, settings, path, storage_options=None):
     """The stages that write a pyramid of a hand-written dataset: creating its
     groups and metadata (as preparing the output dataset does), aggregating the
     converted data onto them, then finalizing the output dataset (which
     consolidates its Zarr metadata).
     """
-    store = zarr.open_group(path, mode="a").store
+    store = zarr.open_group(path, mode="a", storage_options=storage_options).store
 
     for input_path, multiscales in cache.output_groups.multiscale_groups.items():
         group = zarr.open_group(
@@ -288,9 +288,11 @@ def _generate_pyramids(cache, settings, path):
         group.attrs.update(get_multiscale_group_attrs(multiscales, settings.metadata))
 
     create_derived_level_groups(store, cache, settings)
-    generate_pyramids(cache, settings, path)
+    generate_pyramids(cache, settings, path, output_storage_options=storage_options)
 
-    return finalize_healpix_dataset(cache, settings, path)
+    return finalize_healpix_dataset(
+        cache, settings, path, output_storage_options=storage_options
+    )
 
 
 @pytest.fixture
@@ -376,6 +378,21 @@ def test_derived_levels_and_metadata(converted):
 
     # the dataset (STAC item included) is otherwise left as it is
     assert dt.attrs["stac_discovery"] == STAC_ITEM
+
+
+def test_output_storage_options(converted):
+    # an output dataset given as a URL with storage options (e.g., the
+    # credentials of an object store) is opened once with them; the pyramid
+    # stage then reads it back through the store, without the options
+    path, cell_ids, *_ = converted
+    cache, settings = _cache_and_settings([3], {"derived_levels": [2]})
+
+    dt = _generate_pyramids(
+        cache, settings, f"local://{path}", storage_options={"auto_mkdir": True}
+    )
+
+    assert set(dt[GROUP].children) == {"3", "2"}
+    assert dt[GROUP]["2"].sizes["cells"] == cell_ids.size // 4
 
 
 def test_consolidated_metadata_is_up_to_date(converted):
