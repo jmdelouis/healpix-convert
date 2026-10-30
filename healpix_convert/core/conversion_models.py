@@ -168,8 +168,10 @@ class InputGroupSpatialInfo(BaseModel):
 
     def __add__(self, other: InputGroupSpatialInfo) -> InputGroupSpatialInfo:
         # validate and add another input dataset to the group spatial info
+        # (the inputs may have different sizes, e.g. grids of different
+        # spacing next to each other: their points are resampled together)
         invalid = (
-            self.spatial_dimensions != other.spatial_dimensions
+            list(self.spatial_dimensions) != list(other.spatial_dimensions)
             or self.spatial_coordinates != other.spatial_coordinates
             or self.spatial_arrays != other.spatial_arrays
             or self.is_projected is not other.is_projected
