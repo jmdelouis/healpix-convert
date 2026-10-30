@@ -31,7 +31,7 @@ def _init_era5_zarr(path, metadata) -> str:
 
     ERA5Converter(date="2024-01-01", metadata=metadata)._init_zarr(
         str(path),
-        1,
+        {"measurements/enda": [START], "measurements/oper": [START]},
         list(ERA5_ENDA_VARIABLE_META)[:1],
         list(ERA5_OPER_VARIABLE_META)[:1],
         START,

@@ -42,6 +42,15 @@
   the derived levels (Zarr's defaults if not set), e.g. a serializer of
   `healpix-compress` coding one HEALPix cell per chunk. It is checked when the
   settings are created, like the `codecs` group setting.
+- The ERA5 converter writes several analysis times in one store: `date` and
+  `time` take MARS lists and ranges (`date="20260801/to/20260831"`,
+  `time="00:00:00/06:00:00/12:00:00/18:00:00"`), each group gets a `time`
+  coordinate, and the new `time_chunk` option sets how many times a chunk
+  holds (`"all"`: the time series of 1024 cells in one chunk). The enda group
+  gets the 3-hourly times only, the times of the ERA5 EDA. New public
+  `download()`, `dataset()` and `grib_paths()` methods give the GRIB files
+  without writing a store; a single date and time give the same store and
+  cache file names as before.
 - The chunks of a derived level always hold all the children of one HEALPix
   cell: on a partial spatial extent, their cells are no longer coarser than the
   coarsest level the converted cells cover entirely. Before, the chunks of the

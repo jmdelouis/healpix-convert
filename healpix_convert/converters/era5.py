@@ -15,15 +15,25 @@ Usage
     for idx in range(result.n_chunks):
         converter.convert_group(idx)
     converter.consolidate("out.zarr")
+
+Several analysis times go in one store when ``date`` and ``time`` are MARS
+lists or ranges, e.g. a whole day with all its times in one chunk::
+
+    converter = ERA5Converter(
+        date="20260812",
+        time="/".join(f"{h:02d}:00:00" for h in range(24)),
+        time_chunk="all",
+    )
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import healpix_geo
 import numpy as np
@@ -63,6 +73,34 @@ _CHUNK_SIZE = 4 ** (_CHILD_LEVEL - _CHUNK_LEVEL)  # 1,024
 
 _resampler_cache: dict = {}
 
+ENDA_GROUP = "measurements/enda"
+OPER_GROUP = "measurements/oper"
+
+
+def _mars_list(value: str) -> list[str]:
+    """The items of a MARS list (``a/b/c``)."""
+    return [item for item in str(value).split("/") if item]
+
+
+def _enda_times(times: list[str]) -> list[str]:
+    """The times at which ERA5 has EDA (stream=enda) analyses: every 3 hours."""
+    return [t for t in times if int(t[:2]) % 3 == 0]
+
+
+def _cache_tag(date: str, times: list[str]) -> str:
+    """File-name-safe tag of a MARS date (or date list / range) and time list.
+
+    A single date and time give the tag of earlier versions, e.g.
+    ``20250101T00``; a range ``20300101/to/20300131`` becomes
+    ``20300101-to-20300131``. Several times are summarised by the first and the
+    last hour, their number and a hash of the list.
+    """
+    tag = date.replace("-", "").replace("/", "-")
+    if len(times) == 1:
+        return f"{tag}T{times[0][:2]}"
+    digest = hashlib.sha1("/".join(times).encode()).hexdigest()[:6]
+    return f"{tag}T{times[0][:2]}-{times[-1][:2]}n{len(times)}h{digest}"
+
 
 def _get_resampler(
     lon: np.ndarray, lat: np.ndarray, level: int = _CHILD_LEVEL, threshold: float = 0.5
@@ -100,6 +138,8 @@ class ERA5PrepareResult:
     lat_oper: np.ndarray
     vars_enda: list[str]
     vars_oper: list[str]
+    #: analysis times of each group (the EDA has fewer: it is 3-hourly)
+    times: dict[str, list[datetime]] = field(default_factory=dict)
 
 
 class ERA5Converter:
@@ -108,13 +148,23 @@ class ERA5Converter:
 
     Parameters
     ----------
-    date      : "YYYY-MM-DD"
-    time      : "HH:MM:SS"
-    step      : MARS step (default "0")
-    numbers   : ensemble member numbers (default 0-9)
-    local_dir : directory for local GRIB cache
-    metadata  : conventions followed by the output dataset
-                (default: all of them, see :py:class:`MetadataSettings`)
+    date       : "YYYY-MM-DD", or a MARS date list or range
+                 ("20260812/20260813", "20260801/to/20260831")
+    time       : "HH:MM:SS", or a MARS list of times
+                 ("00:00:00/06:00:00/12:00:00/18:00:00"). The EDA (enda group)
+                 has analyses every 3 hours only: it gets the times among these
+                 that fall on 00, 03, ..., 21 UTC.
+    step       : MARS step (default "0")
+    numbers    : ensemble member numbers (default 0-9); the first one is written
+    local_dir  : directory for local GRIB cache (see :py:meth:`grib_paths`)
+    metadata   : conventions followed by the output dataset
+                 (default: all of them, see :py:class:`MetadataSettings`)
+    time_chunk : number of analysis times in one zarr chunk, or "all" for all
+                 the times of a group (one chunk then holds the time series of
+                 1024 cells). Default 1, one chunk per time.
+
+    With several times, each group gets a ``time`` coordinate (the enda and oper
+    groups may have different times).
     """
 
     def __init__(
@@ -125,9 +175,18 @@ class ERA5Converter:
         numbers: list[int] = None,
         local_dir: Path = Path("."),
         metadata: MetadataSettings | None = None,
+        time_chunk: int | Literal["all"] = 1,
     ):
+        if time_chunk != "all" and (not isinstance(time_chunk, int) or time_chunk < 1):
+            raise ValueError(
+                f"time_chunk must be a positive int or 'all', got {time_chunk!r}"
+            )
         self.date = date
         self.time = time
+        self.times = _mars_list(time)
+        if not self.times:
+            raise ValueError(f"no time in {time!r}")
+        self.time_chunk = time_chunk
         self.step = step
         self.numbers = numbers if numbers is not None else DEFAULT_NUMBERS
         self.local_dir = Path(local_dir)
@@ -136,47 +195,84 @@ class ERA5Converter:
         self._map_cache: dict = {}
         self._sub_resampler_cache: dict = {}
 
+    def grib_paths(self) -> dict[str, Path]:
+        """The local GRIB files of each group (downloaded if missing).
+
+        GRIB files already at these paths are used as they are, so data
+        downloaded beforehand can be converted by placing it there.
+        """
+        enda_times = _enda_times(self.times) or self.times
+        return {
+            ENDA_GROUP: self.local_dir
+            / f"era5_enda_{_cache_tag(self.date, enda_times)}_{ERA5_ENDA_GRID}.grib",
+            OPER_GROUP: self.local_dir
+            / f"era5_oper_{_cache_tag(self.date, self.times)}_{ERA5_OPER_GRID}.grib",
+        }
+
+    def download(self, force: bool = False) -> dict[str, Path]:
+        """Download the GRIB files from the CDS unless they are already there."""
+        if not _enda_times(self.times):
+            raise ValueError(
+                f"none of the times {self.times} has an ERA5 EDA analysis "
+                "(stream=enda, every 3 hours: 00, 03, ..., 21 UTC)"
+            )
+        paths = self.grib_paths()
+        missing = [p for p in paths.values() if force or not p.exists()]
+        if missing:
+            import cdsapi
+
+            if force or not paths[ENDA_GROUP].exists():
+                self._download_enda(paths[ENDA_GROUP], cdsapi.Client(url=CDS_URL))
+            if force or not paths[OPER_GROUP].exists():
+                self._download_oper(paths[OPER_GROUP], cdsapi.Client(url=CDS_URL))
+        return paths
+
+    def dataset(self) -> dict[str, xr.Dataset]:
+        """The downloaded GRIB files opened with cfgrib, one dataset per group.
+
+        Each dataset has a ``time`` dimension (of length 1 for a single time)
+        and holds the first requested ensemble member only.
+        """
+        import cfgrib
+
+        datasets = {}
+        for group, path in self.grib_paths().items():
+            log.info(f"Loading cfgrib {path.name}...")
+            ds = xr.merge(
+                cfgrib.open_datasets(str(path)), join="override", compat="override"
+            )
+            # cfgrib names some oper fields by their native shortName, which
+            # differs from the keys used in ERA5_OPER_VARIABLE_META. Rename so the
+            # variables are recognised (otherwise mslp/sic are silently dropped).
+            ds = ds.rename(
+                {
+                    k: v
+                    for k, v in {
+                        "msl": "mslp",
+                        "siconc": "sic",
+                    }.items()
+                    if k in ds.data_vars and v not in ds.data_vars
+                }
+            )
+            if "number" in ds.dims:
+                ds = ds.isel(number=0)
+            if "time" not in ds.dims:
+                ds = ds.expand_dims("time")
+            datasets[group] = ds
+        return datasets
+
     def prepare(
         self, output_path: str, force_download: bool = False
     ) -> ERA5PrepareResult:
         """Download ERA5 GRIBs (if needed), build PSFResamplers, init zarr."""
-        import cdsapi
-        import cfgrib
         import pandas as pd
 
         self._map_cache = {}
         self._sub_resampler_cache = {}
 
-        grib_enda = self._grib_path("enda", ERA5_ENDA_GRID)
-        grib_oper = self._grib_path("oper", ERA5_OPER_GRID)
-
-        if not grib_enda.exists() or force_download:
-            self._download_enda(grib_enda, cdsapi.Client(url=CDS_URL))
-        if not grib_oper.exists() or force_download:
-            self._download_oper(grib_oper, cdsapi.Client(url=CDS_URL))
-
-        log.info("Loading cfgrib enda...")
-        ds_enda = xr.merge(
-            cfgrib.open_datasets(str(grib_enda)), join="override", compat="override"
-        )
-        log.info("Loading cfgrib oper...")
-        ds_oper = xr.merge(
-            cfgrib.open_datasets(str(grib_oper)), join="override", compat="override"
-        )
-
-        # cfgrib names some oper fields by their native shortName, which differs
-        # from the keys used in ERA5_OPER_VARIABLE_META. Rename so the variables
-        # are recognised (otherwise mslp/sic are silently dropped).
-        ds_oper = ds_oper.rename(
-            {
-                k: v
-                for k, v in {
-                    "msl": "mslp",
-                    "siconc": "sic",
-                }.items()
-                if k in ds_oper.data_vars and v not in ds_oper.data_vars
-            }
-        )
+        paths = self.download(force=force_download)
+        datasets = self.dataset()
+        ds_enda, ds_oper = datasets[ENDA_GROUP], datasets[OPER_GROUP]
 
         lon_enda, lat_enda = self._extract_lonlat(ds_enda)
         lon_oper, lat_oper = self._extract_lonlat(ds_oper)
@@ -184,31 +280,22 @@ class ERA5Converter:
         nr_enda = _get_resampler(lon_enda, lat_enda)
         nr_oper = _get_resampler(lon_oper, lat_oper)
 
-        vt = ds_enda.get("valid_time", ds_enda.get("time", None))
-        if vt is not None:
-            times = [
+        times = {
+            group: [
                 pd.Timestamp(t).tz_localize(None).to_pydatetime().replace(tzinfo=UTC)
-                for t in np.atleast_1d(vt.values).ravel()[:1]
+                for t in np.atleast_1d(ds["valid_time"].values).ravel()
             ]
-        else:
-            hh = int(self.time[:2])
-            times = [
-                datetime(
-                    int(self.date[:4]),
-                    int(self.date[5:7]),
-                    int(self.date[8:]),
-                    hh,
-                    tzinfo=UTC,
-                )
-            ]
+            for group, ds in datasets.items()
+        }
+        all_times = sorted({t for group_times in times.values() for t in group_times})
 
         vars_enda = [v for v in ERA5_ENDA_VARIABLE_META if v in ds_enda.data_vars]
         vars_oper = [v for v in ERA5_OPER_VARIABLE_META if v in ds_oper.data_vars]
-        start_dt, end_dt = min(times), max(times)
-        n_times = len(times)
+        start_dt, end_dt = all_times[0], all_times[-1]
+        n_times = len(all_times)
         n_chunks = _N_PARENT
 
-        self._init_zarr(output_path, n_times, vars_enda, vars_oper, start_dt, end_dt)
+        self._init_zarr(output_path, times, vars_enda, vars_oper, start_dt, end_dt)
 
         self._result = ERA5PrepareResult(
             output_path=output_path,
@@ -216,8 +303,8 @@ class ERA5Converter:
             n_times=n_times,
             start_dt=start_dt,
             end_dt=end_dt,
-            grib_enda=grib_enda,
-            grib_oper=grib_oper,
+            grib_enda=paths[ENDA_GROUP],
+            grib_oper=paths[OPER_GROUP],
             ds_enda=ds_enda,
             ds_oper=ds_oper,
             nr_enda=nr_enda,
@@ -228,6 +315,7 @@ class ERA5Converter:
             lat_oper=lat_oper,
             vars_enda=vars_enda,
             vars_oper=vars_oper,
+            times=times,
         )
         log.info(f"ERA5 prepare done: {n_chunks} chunks, {n_times} timestep(s)")
         return self._result
@@ -252,33 +340,21 @@ class ERA5Converter:
 
         root = zarr.open_group(r.output_path, mode="a")
 
-        for group, ds, nr, variables, meta in [
-            (
-                "measurements/enda",
-                r.ds_enda,
-                r.nr_enda,
-                r.vars_enda,
-                ERA5_ENDA_VARIABLE_META,
-            ),
-            (
-                "measurements/oper",
-                r.ds_oper,
-                r.nr_oper,
-                r.vars_oper,
-                ERA5_OPER_VARIABLE_META,
-            ),
+        for group, ds, nr, variables in [
+            (ENDA_GROUP, r.ds_enda, r.nr_enda, r.vars_enda),
+            (OPER_GROUP, r.ds_oper, r.nr_oper, r.vars_oper),
         ]:
             grp = root[group]
-            t_dim = next(
-                (d for d in ["valid_time", "time", "number", "step"] if d in ds.dims),
-                None,
-            )
 
+            # all the times of the chunk at once: a zarr chunk may hold several
             for var in variables:
                 zarr_a = grp[var]
-                for t in range(r.n_times):
-                    full_map = self._full_map(group, var, t, ds, nr, t_dim)
-                    zarr_a[t, chunk_sl] = full_map[cell_ids]
+                zarr_a[:, chunk_sl] = np.stack(
+                    [
+                        self._full_map(group, var, t, ds, nr, "time")[cell_ids]
+                        for t in range(len(r.times[group]))
+                    ]
+                )
 
             grp["cell_ids"][chunk_sl] = cell_ids
 
@@ -348,8 +424,12 @@ class ERA5Converter:
         return r.lon_oper, r.lat_oper
 
     def _valid_resampler(self, group: str, var: str, valid: np.ndarray) -> PSFResampler:
-        """PSFResampler built on the valid (non-NaN) source points of a field."""
-        k = (group, var)
+        """PSFResampler built on the valid (non-NaN) source points of a field.
+
+        Cached per mask, so that a field whose mask changes with time gets the
+        right resampler, and fields sharing a mask (sst, sic) share it.
+        """
+        k = (group, hashlib.sha1(np.packbits(valid).tobytes()).hexdigest())
         sub = self._sub_resampler_cache.get(k)
         if sub is None:
             lon, lat = self._group_lonlat(group)
@@ -385,10 +465,6 @@ class ERA5Converter:
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
-    def _grib_path(self, stream: str, grid: str) -> Path:
-        tag = self.date.replace("-", "")
-        return self.local_dir / f"era5_{stream}_{tag}T{self.time[:2]}_{grid}.grib"
-
     def _download_enda(self, path: Path, client: Any) -> None:
         log.info(f"Downloading ERA5 enda → {path}")
         client.retrieve(
@@ -401,7 +477,7 @@ class ERA5Converter:
                 "param": "/".join(v[0] for v in ERA5_ENDA_VARIABLE_META.values()),
                 "step": self.step,
                 "stream": "enda",
-                "time": self.time,
+                "time": "/".join(_enda_times(self.times)),
                 "type": "an",
                 "grid": ERA5_ENDA_GRID,
                 "number": "/".join(str(n) for n in self.numbers),
@@ -421,7 +497,7 @@ class ERA5Converter:
                 "param": "/".join(v[0] for v in ERA5_OPER_VARIABLE_META.values()),
                 "step": self.step,
                 "stream": "oper",
-                "time": self.time,
+                "time": "/".join(self.times),
                 "type": "an",
                 "grid": ERA5_OPER_GRID,
             },
@@ -443,7 +519,7 @@ class ERA5Converter:
     def _init_zarr(
         self,
         output_path: str,
-        n_times: int,
+        times: dict[str, list[datetime]],
         vars_enda: list,
         vars_oper: list,
         start_dt: datetime,
@@ -458,10 +534,17 @@ class ERA5Converter:
             ellipsoid={"name": "wgs84"},
         )
 
+        # a time coordinate is only needed to tell several times apart
+        several_times = any(len(group_times) > 1 for group_times in times.values())
+
         for group, variables, meta in [
-            ("measurements/enda", vars_enda, ERA5_ENDA_VARIABLE_META),
-            ("measurements/oper", vars_oper, ERA5_OPER_VARIABLE_META),
+            (ENDA_GROUP, vars_enda, ERA5_ENDA_VARIABLE_META),
+            (OPER_GROUP, vars_oper, ERA5_OPER_VARIABLE_META),
         ]:
+            n_times = len(times[group])
+            time_chunk = (
+                n_times if self.time_chunk == "all" else min(self.time_chunk, n_times)
+            )
             grp = root.require_group(group)
             grp.attrs.update(get_healpix_group_attrs(healpix_model, self.metadata))
             grp.create_array(
@@ -484,6 +567,25 @@ class ERA5Converter:
                 )
                 crs[...] = 0
 
+            if several_times:
+                # analysis times in hours since 00 UTC of the first day (CF)
+                epoch = start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+                time_arr = grp.create_array(
+                    "time",
+                    shape=(n_times,),
+                    dtype=np.int64,
+                    chunks=(n_times,),
+                    dimension_names=("time",),
+                    attributes={
+                        "standard_name": "time",
+                        "long_name": "analysis time",
+                        "axis": "T",
+                        "units": f"hours since {epoch:%Y-%m-%d %H:%M:%S}",
+                        "calendar": "proleptic_gregorian",
+                    },
+                )
+                time_arr[:] = [(t - epoch) // timedelta(hours=1) for t in times[group]]
+
             cf_variable_attrs = get_cf_data_variable_attrs(healpix_model, self.metadata)
 
             for var in variables:
@@ -492,7 +594,7 @@ class ERA5Converter:
                     var,
                     shape=(n_times, _N_CHILD),
                     dtype=np.float32,
-                    chunks=(1, _CHUNK_SIZE),
+                    chunks=(time_chunk, _CHUNK_SIZE),
                     fill_value=np.nan,
                     dimension_names=("time", "cells"),
                     attributes={
