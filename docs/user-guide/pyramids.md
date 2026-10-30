@@ -171,6 +171,17 @@ that code one parent cell per chunk, like the Sentinel-2 serializers of
 were written with: the codecs of a lossy serializer are not reused implicitly,
 as they would code the aggregated values a second time.
 
+A `sharding_indexed` serializer writes one shard per chunk of a derived level,
+with the inner chunks it gives. The chunks of the coarsest derived levels may
+hold fewer cells than those inner chunks: there, the inner chunks are cut to
+the chunk, i.e. each shard holds one inner chunk.
+
+The cell ids of the derived levels are written with the codecs of the cell ids
+of the converted level (the `healpix_coordinate_codecs` group setting, e.g. a
+delta filter), on the chunks of the derived level. Sharded converted cell ids
+give one shard per chunk of a derived level, with the same inner chunks, or the
+whole chunk where it is smaller.
+
 ## Groups converted at several levels
 
 The native levels of a multiscale group are kept as they are. Generating

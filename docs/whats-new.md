@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- The pyramids can be written with a `sharding_indexed` serializer in the
+  `codecs` pyramid setting: the inner chunks are cut to the chunks of the
+  coarsest derived levels where those hold fewer cells. Before, the conversion
+  failed at the end of the pyramid stage with a `ValueError`.
+- The cell ids of the derived levels are written with the codecs of the cell ids
+  of the converted level (e.g. a delta filter set by the
+  `healpix_coordinate_codecs` group setting), sharded like them. Before, they
+  had Zarr's default codecs, and took far more space than the converted ones.
 - New `finalize_healpix_dataset` conversion stage, the last one, run once every
   group of the output dataset has been written: it consolidates the Zarr
   metadata of the output dataset. No other stage writes consolidated metadata

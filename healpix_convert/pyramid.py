@@ -293,14 +293,79 @@ def _build_derived_level(
 
     ds = encode_like(ds, templates)
 
+    coordinate = healpix.coordinate
+    if isinstance(coordinate, str) and coordinate in ds.coords:
+        ds[coordinate].encoding.update(
+            _cell_ids_encoding(templates[coordinate], chunk_size)
+        )
+
     if pyramid.codecs is not None:
         # the aggregated variables only (not the cell ids coordinate)
         encoding = codecs_encoding(pyramid.codecs)
         for name, var in ds.data_vars.items():
             if healpix.spatial_dimension in var.dims:
-                var.encoding.update(encoding)
+                var.encoding.update(
+                    _fit_inner_chunks(
+                        encoding, var.dims.index(healpix.spatial_dimension), chunk_size
+                    )
+                )
 
     return ds.chunk({healpix.spatial_dimension: chunk_size})
+
+
+def _cell_ids_encoding(template: xr.Variable, chunk_size: int) -> dict[str, Any]:
+    """Zarr encoding of the cell ids of a derived level: the codecs of the cell
+    ids of the converted level (e.g. a delta filter), on the chunks of the
+    derived level.
+
+    Sharded converted cell ids give sharded derived ones, one shard per chunk
+    of the derived level, with the inner chunks of the converted level or the
+    whole shard where it is smaller.
+
+    """
+    encoding = {
+        key: value
+        for key, value in template.encoding.items()
+        if key in ("filters", "serializer", "compressors")
+    }
+
+    if template.encoding.get("shards") is not None:
+        (inner,) = template.encoding["chunks"]
+        encoding |= {"chunks": (min(inner, chunk_size),), "shards": (chunk_size,)}
+
+    return encoding
+
+
+def _fit_inner_chunks(
+    encoding: Mapping[str, Any], axis: int, chunk_size: int
+) -> dict[str, Any]:
+    """The encoding of the ``codecs`` pyramid setting for a variable of a
+    derived level whose chunks hold ``chunk_size`` cells along ``axis``.
+
+    The inner chunks of a sharding serializer are the same at every level,
+    while the chunks of the coarsest levels may hold fewer cells: there, the
+    inner chunks are cut to the chunk (one inner chunk per shard).
+
+    """
+    from zarr.codecs import ShardingCodec
+
+    serializer = encoding.get("serializer")
+    if not isinstance(serializer, ShardingCodec):
+        return dict(encoding)
+
+    inner = list(serializer.chunk_shape)
+    if inner[axis] <= chunk_size:
+        return dict(encoding)
+
+    inner[axis] = chunk_size
+    fitted = ShardingCodec(
+        chunk_shape=tuple(inner),
+        codecs=serializer.codecs,
+        index_codecs=serializer.index_codecs,
+        index_location=serializer.index_location,
+    )
+
+    return {**encoding, "serializer": fitted}
 
 
 def _set_cf_grid_mapping(ds: xr.Dataset, healpix: Healpix) -> xr.Dataset:

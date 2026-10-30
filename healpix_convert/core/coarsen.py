@@ -321,7 +321,8 @@ def encode_like(ds: xr.Dataset, templates: Mapping[str, xr.Variable]) -> xr.Data
     The codecs of the input are not reused: the derived levels have their own
     cells and chunks, and the codecs of a lossy serializer would code the
     aggregated values a second time. They are set by the ``codecs`` pyramid
-    setting (see :py:func:`codecs_encoding`).
+    setting (see :py:func:`codecs_encoding`), and the codecs of the cell ids
+    by the pyramid stage itself.
 
     """
     ds = ds.copy()
