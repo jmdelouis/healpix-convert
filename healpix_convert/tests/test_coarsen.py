@@ -7,7 +7,11 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from healpix_convert.core.coarsen import coarsen_healpix_group, nanmode
+from healpix_convert.core.coarsen import (
+    coarsen_healpix_group,
+    nanbitwise_or,
+    nanmode,
+)
 from healpix_convert.core.healpix_conventions import Healpix
 from healpix_convert.core.metadata import get_healpix_group_attrs
 from healpix_convert.settings.common import MetadataSettings
@@ -162,3 +166,76 @@ def test_coarsen_healpix_group_mode_keeps_data_type():
 
     assert coarsened["a"].dtype == np.dtype("uint8")
     np.testing.assert_array_equal(coarsened["a"].values, [3])
+
+
+class TestNanbitwiseOr:
+    def test_integers(self):
+        # a flag set in one cell only is kept
+        values = np.array([[0b0001, 0b0000, 0b0100, 0b0000], [0, 0, 0, 0]], "uint8")
+
+        result = nanbitwise_or(values, axis=-1)
+
+        assert result.dtype == np.dtype("uint8")
+        np.testing.assert_array_equal(result, [0b0101, 0])
+
+    def test_signed_integers(self):
+        # the sign bit is a flag like the others
+        values = np.array([[-128, 1, 0, 2]], dtype="int8")
+
+        np.testing.assert_array_equal(nanbitwise_or(values, axis=-1), [-125])
+
+    @pytest.mark.parametrize(
+        ["values", "expected"],
+        [
+            pytest.param([1.0, np.nan, 8.0, np.nan], 9.0, id="missing-skipped"),
+            pytest.param([np.nan] * 4, np.nan, id="all-missing"),
+            # the highest bits of the integer data type are kept
+            pytest.param([2.0**31, np.nan, 1.0, 1.0], 2.0**31 + 1, id="high-bit"),
+        ],
+    )
+    def test_missing_values(self, values, expected):
+        # integer flags whose fill value is decoded as NaN
+        result = nanbitwise_or(np.array([values]), axis=-1, dtype="uint32")
+
+        np.testing.assert_array_equal(result, [expected])
+
+
+def test_coarsen_healpix_group_bitwise_or():
+    # bit flags: two level-6 cells, the second one partly without data
+    flags = np.array([1, 0, 0, 4, 2, np.nan, np.nan, 16])
+    ds = _group(_dense_cells(5, [100])[:8], a=flags).chunk({"cells": 4})
+    ds["a"].encoding["dtype"] = np.dtype("uint16")
+
+    coarsened = coarsen_healpix_group(ds, 6, healpix=HEALPIX, reduce="bitwise_or")
+
+    # blockwise, hence lazy, like the other reductions
+    assert coarsened["a"].chunks is not None
+    np.testing.assert_array_equal(coarsened["a"].values, [5.0, 18.0])
+
+
+def test_coarsen_healpix_group_bitwise_or_keeps_data_type():
+    flags = np.array([0b1000, 0b0001, 0b0000, 0b1000], dtype="uint8")
+    ds = _group(_dense_cells(6, [25]), a=flags)
+
+    coarsened = coarsen_healpix_group(ds, 6, healpix=HEALPIX, reduce="bitwise_or")
+
+    assert coarsened["a"].dtype == np.dtype("uint8")
+    # the mode would give 0b1000 only
+    np.testing.assert_array_equal(coarsened["a"].values, [0b1001])
+
+
+@pytest.mark.parametrize(
+    ["values", "encoded_dtype", "match"],
+    [
+        pytest.param(np.arange(4.0), None, "integer bit flags", id="float"),
+        # 64-bit flags with a fill value, decoded as float64
+        pytest.param(np.arange(4.0), "uint64", "do not hold all", id="decoded-64-bit"),
+    ],
+)
+def test_coarsen_healpix_group_bitwise_or_needs_integers(values, encoded_dtype, match):
+    ds = _group(_dense_cells(6, [25]), a=values)
+    if encoded_dtype is not None:
+        ds["a"].encoding["dtype"] = np.dtype(encoded_dtype)
+
+    with pytest.raises(ValueError, match=match):
+        coarsen_healpix_group(ds, 6, healpix=HEALPIX, reduce="bitwise_or")

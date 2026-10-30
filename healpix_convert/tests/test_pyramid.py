@@ -522,6 +522,45 @@ def test_reduce_mode(tmp_path):
     np.testing.assert_array_equal(level2.values, expected)
 
 
+@pytest.mark.parametrize("fill_value", [None, 255])
+def test_reduce_bitwise_or(tmp_path, fill_value):
+    # bit flags at the level 3, aggregated onto the level 2
+    cell_ids = _dense_cells(3)
+    rng = np.random.default_rng(0)
+    # each bit set in about one cell out of five: often in a minority of the
+    # children of a cell
+    bits = rng.random((cell_ids.size, 4)) < 0.2
+    flags = (bits * (1 << np.arange(4))).sum(axis=1).astype("uint8")
+    missing = np.zeros(cell_ids.size, dtype=bool)
+    if fill_value is not None:
+        # some cells without data
+        missing = rng.random(cell_ids.size) < 0.3
+        flags[missing] = fill_value
+    ds = _level_dataset(3, cell_ids, flags=flags)
+    if fill_value is not None:
+        ds["flags"].attrs["_FillValue"] = fill_value
+    path = _write_converted(tmp_path / "converted.zarr", {3: ds})
+
+    dt = _generate_pyramids(
+        *_cache_and_settings([3], {"derived_levels": [2], "reduce": "bitwise_or"}),
+        path,
+    )
+
+    assert dt[f"{GROUP}/2"]["flags"].encoding["dtype"] == np.dtype("uint8")
+    # every flag set in one of the 4 children, the missing ones skipped; the
+    # fill value where all the children are missing
+    blocks = np.where(missing, 0, flags).reshape(-1, 4)
+    expected = np.bitwise_or.reduce(blocks, axis=1)
+    if fill_value is not None:
+        expected[missing.reshape(-1, 4).all(axis=1)] = fill_value
+    else:
+        # no fill value: a block of cells without any flag gives 0, not missing
+        assert (expected == 0).any()
+    stored = zarr.open_array(path, path=f"{GROUP}/2/flags")[:]
+    assert stored.dtype == np.dtype("uint8")
+    np.testing.assert_array_equal(stored, expected)
+
+
 def test_derived_chunks_are_healpix_cells(converted):
     path, *_ = converted
     cache, settings = _cache_and_settings([3], {"derived_levels": [2, 1]})

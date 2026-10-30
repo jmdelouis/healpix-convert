@@ -602,6 +602,11 @@ class PyramidSettings(BaseModel):
     Missing (NaN) values are skipped. The mean does not suit categorical data
     (masks, classifications): aggregate those with "mode", the most frequent
     value of the cells of a block (the smallest of them in case of a tie).
+
+    Bit flags (integer variables where each bit is a flag of its own, e.g.
+    quality flags) are aggregated with "bitwise_or": a flag is set in a coarser
+    cell if it is set in any of its cells (missing cells are skipped). It needs
+    integer variables only, the data type of which is preserved.
     """
 
     codecs: list[CodecSettings] | None = Field(default=None)

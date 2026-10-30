@@ -4,7 +4,7 @@ Aggregating HEALPix data onto the cells of a coarser refinement level.
 
 from __future__ import annotations
 
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Collection, Hashable, Mapping, Sequence
 from typing import Any, Literal, TypeAlias
 
 import numpy as np
@@ -16,8 +16,10 @@ from healpix_convert.core.healpix_conventions import Healpix
 #: are the reductions that Xarray's coarsen applies to a block of cells and
 #: that give, for a whole block, the same result as aggregating all its cells
 #: at once (unlike, e.g., the median). ``"mode"`` (the most frequent value) is
-#: for categorical variables: masks, classifications.
-ReduceMethod: TypeAlias = Literal["mean", "min", "max", "sum", "mode"]
+#: for categorical variables: masks, classifications. ``"bitwise_or"`` is for
+#: bit flags (integer variables where each bit is a flag of its own): a flag is
+#: set in a coarser cell if it is set in any of its cells.
+ReduceMethod: TypeAlias = Literal["mean", "min", "max", "sum", "mode", "bitwise_or"]
 
 #: Encoding of an input variable reused for the aggregated ones: how the values
 #: are stored (data type, fill value, CF packing), not how the chunks are
@@ -116,6 +118,72 @@ def _blocks_mode(var: xr.DataArray, dim: str, window: int) -> xr.DataArray:
     )
 
 
+def _flags_dtype(var: xr.DataArray, name: Hashable) -> np.dtype:
+    """Integer data type of the bit flags of ``var``: its own, or the stored
+    one when its fill value has been decoded as NaN.
+    """
+    dtype = np.dtype(var.encoding.get("dtype", var.dtype))
+    if not np.issubdtype(dtype, np.integer):
+        raise ValueError(
+            f"the 'bitwise_or' reduction needs integer bit flags, but the variable "
+            f"{name!r} has the data type {dtype}"
+        )
+    if np.issubdtype(var.dtype, np.floating) and dtype.itemsize > 4:
+        # a 64-bit integer decoded as float64 has lost its high bits already
+        raise ValueError(
+            f"the 'bitwise_or' reduction does not support the variable {name!r}: "
+            f"its {dtype} values are decoded as floating point values (it has a "
+            "fill value), which do not hold all their bits"
+        )
+
+    return dtype
+
+
+def nanbitwise_or(
+    values: np.ndarray, axis: int | tuple[int, ...] = -1, *, dtype=None
+) -> np.ndarray:
+    """Bitwise OR along ``axis``, missing (NaN) values skipped.
+
+    ``values`` are integers, or the floating point values of integers with
+    missing values (``dtype`` gives their integer data type). A bit is set in
+    the result if it is set in any of the values. All values missing gives NaN.
+
+    """
+    values = np.asarray(values)
+    if not np.issubdtype(values.dtype, np.floating):
+        return np.bitwise_or.reduce(values, axis=axis)
+
+    missing = np.isnan(values)
+    flags = np.where(missing, 0, values).astype(dtype)
+    result = np.bitwise_or.reduce(flags, axis=axis).astype(values.dtype)
+
+    return np.where(missing.all(axis=axis), np.nan, result)
+
+
+def _blocks_bitwise_or(
+    var: xr.DataArray, dim: str, window: int, dtype: np.dtype
+) -> xr.DataArray:
+    """Bitwise OR of each block of ``window`` consecutive cells, computed
+    blockwise (lazily on Dask arrays), like Xarray's own reductions.
+    """
+    var = var.reset_coords(drop=True)
+    windows = var.coarsen({dim: window}).construct(
+        {dim: (dim, "window")}, keep_attrs=True
+    )
+    if windows.chunks is not None:
+        windows = windows.chunk({"window": -1})
+
+    return xr.apply_ufunc(
+        nanbitwise_or,
+        windows,
+        input_core_dims=[["window"]],
+        kwargs={"axis": -1, "dtype": dtype},
+        dask="parallelized",
+        output_dtypes=[var.dtype],
+        keep_attrs=True,
+    )
+
+
 def coarsen_healpix_group(
     ds: xr.Dataset,
     level: int,
@@ -149,8 +217,9 @@ def coarsen_healpix_group(
         cell dimension and cell ids coordinate.
     reduce : str, optional
         How the values of the children cells are aggregated (default: "mean");
-        "mode" gives their most frequent value (see :py:func:`nanmode`).
-        Missing (NaN) values are skipped.
+        "mode" gives their most frequent value (see :py:func:`nanmode`),
+        "bitwise_or" the bits set in any of them, for integer bit flags (see
+        :py:func:`nanbitwise_or`). Missing (NaN) values are skipped.
 
     Returns
     -------
@@ -182,6 +251,11 @@ def coarsen_healpix_group(
         coarsened = blocks.min(keep_attrs=True)
         for name in cell_vars:
             coarsened[name] = _blocks_mode(ds[name], dim, window)
+    elif reduce == "bitwise_or":
+        dtypes = {name: _flags_dtype(ds[name], name) for name in cell_vars}
+        coarsened = blocks.min(keep_attrs=True)
+        for name in cell_vars:
+            coarsened[name] = _blocks_bitwise_or(ds[name], dim, window, dtypes[name])
     else:
         reduce_blocks = getattr(blocks, reduce)
         coarsened = reduce_blocks(keep_attrs=True)

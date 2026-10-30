@@ -324,6 +324,15 @@ def test_pyramid_settings_chunk_method() -> None:
     )
 
 
+@pytest.mark.parametrize("reduce", ["mode", "bitwise_or"])
+def test_pyramid_settings_reduce_method(reduce) -> None:
+    settings = ConvertSettings.model_validate(
+        _multiscale_settings_dict({"derived_levels": [3], "reduce": reduce})
+    )
+
+    assert reduce in settings.model_dump_json()
+
+
 def test_pyramid_settings_unsupported_reduce_method() -> None:
     with pytest.raises(ValidationError, match="reduce"):
         ConvertSettings.model_validate(

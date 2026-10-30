@@ -762,13 +762,14 @@
         },
         "reduce": {
           "default": "mean",
-          "description": "How the values of the children cells are aggregated.\n\nMissing (NaN) values are skipped. The mean does not suit categorical data\n(masks, classifications): aggregate those with \"mode\", the most frequent\nvalue of the cells of a block (the smallest of them in case of a tie).",
+          "description": "How the values of the children cells are aggregated.\n\nMissing (NaN) values are skipped. The mean does not suit categorical data\n(masks, classifications): aggregate those with \"mode\", the most frequent\nvalue of the cells of a block (the smallest of them in case of a tie).\n\nBit flags (integer variables where each bit is a flag of its own, e.g.\nquality flags) are aggregated with \"bitwise_or\": a flag is set in a coarser\ncell if it is set in any of its cells (missing cells are skipped). It needs\ninteger variables only, the data type of which is preserved.",
           "enum": [
             "mean",
             "min",
             "max",
             "sum",
-            "mode"
+            "mode",
+            "bitwise_or"
           ],
           "title": "Reduce",
           "type": "string"

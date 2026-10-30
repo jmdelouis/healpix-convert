@@ -95,7 +95,15 @@ reduction (`"min"`, `"max"`, `"sum"`): these are the reductions that give, for
 a whole block of cells, the same result as aggregating all its cells at once.
 The mean does not suit categorical data such as masks or classifications:
 aggregate those with `"mode"`, the most frequent value of the cells of a block
-(the smallest of them in case of a tie).
+(the smallest of them in case of a tie). Bit flags, i.e. integer variables
+where each bit is a flag of its own (e.g. quality flags), are aggregated with
+`"bitwise_or"`: a flag is set in a coarser cell if it is set in any of its
+cells, even in a minority of them, which `"mode"` would drop. Missing cells
+(the fill value) are skipped, and a coarser cell with no data gets the fill
+value. Signed and unsigned integers are both supported (the sign bit is a flag
+like the others); a floating point variable is an error, as is a 64-bit
+integer variable with a fill value, whose values are decoded as floating point
+values that do not hold all their bits.
 
 The data type and the fill value of each variable are preserved, an integer
 variable being rounded instead of truncated.
