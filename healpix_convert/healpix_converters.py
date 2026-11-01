@@ -443,8 +443,68 @@ class HealpixGroupConverter(ABC):
 
         return zarrays
 
+    def _input_crop(self) -> list[tuple[slice, slice] | None] | None:
+        """Per input dataset, the projected x / y slices that hold every pixel
+        the chunks of this group query (their buffered polygons), as
+        ``_query_chunk_input_points_projected`` slices them; ``None`` for a
+        dataset no chunk overlaps. ``None`` if the input is not projected or
+        this converter has no chunks."""
+        chunk_cell_ids = getattr(self, "chunk_cell_ids", None)
+        if not self.spatial_info.is_projected or chunk_cell_ids is None:
+            return None
+        crs_wgs84 = pyproj.CRS.from_epsg(4326)
+        buffer = getattr(self, "chunk_buffer", 0.0) or 0.0
+        input_extents = self.root_spatial_info.get_extents()[0]
+        per_dataset: list[list[shapely.Polygon]] = [[] for _ in self.datasets]
+        for chunk_cell_id in np.atleast_1d(chunk_cell_ids):
+            lon, lat = healpix_geo.nested.vertices(
+                chunk_cell_id,
+                self.chunk_healpix.refinement_level,
+                ellipsoid=self.chunk_healpix.ellipsoid.name,
+            )
+            polys = utils.reproject_to_multiple_crs(
+                shapely.Polygon(list(zip(lon[0], lat[0]))), crs_wgs84, self.spatial_info.crs
+            )
+            for i, (poly, extent) in enumerate(zip(polys, input_extents)):
+                if buffer > 0.0:
+                    poly = shapely.buffer(poly, buffer)
+                per_dataset[i].append(shapely.intersection(poly, extent))
+        transforms = self.spatial_info.transform or [None] * len(self.datasets)
+        crops: list[tuple[slice, slice] | None] = []
+        for polys, transform in zip(per_dataset, transforms):
+            polys = [p for p in polys if not p.is_empty]
+            if not polys:
+                crops.append(None)
+                continue
+            xmin, ymin, xmax, ymax = shapely.bounds(shapely.union_all(polys))
+            xslice, yslice = slice(xmin, xmax), slice(ymax, ymin)
+            if transform is not None:
+                if transform.a < 0:
+                    xslice = slice(xmax, xmin)
+                if transform.e > 0:
+                    yslice = slice(ymin, ymax)
+            crops.append((xslice, yslice))
+        return crops
+
+    def _crop_to_chunks(self, datasets: list[xr.Dataset]) -> list[xr.Dataset]:
+        """The input datasets cut to the pixels the chunks of this group read
+        (see ``_input_crop``): what is loaded once for all the chunks."""
+        crops = self._input_crop()
+        if crops is None:
+            return datasets
+        out = []
+        for ds, crop in zip(datasets, crops):
+            if crop is None:
+                # no chunk reads it: keep an empty selection of the same layout
+                out.append(ds.isel(x=slice(0, 0), y=slice(0, 0)))
+            else:
+                out.append(ds.sel(x=crop[0], y=crop[1]))
+        return out
+
     def load_datasets(self, client: dask.distributed.Client | None = None) -> None:
-        """Preload all input datasets or persist them in distributed memory when using dask."""
+        """Preload all input datasets or persist them in distributed memory when
+        using dask, cut to the pixels the chunks of this group read: each input
+        is then read once for all the chunks, instead of once per chunk."""
         if client is not None:
             # re-open input datasets with chunks={} -> set chunks aligned with zarr
             reopened_datasets = utils.open_datasets(
@@ -455,12 +515,13 @@ class HealpixGroupConverter(ABC):
                 self.settings.extra_dimensions,
                 self.spatial_info.spatial_dimensions,
             )
+            reopened_datasets = self._crop_to_chunks(reopened_datasets)
             self.datasets = [ds.persist(scheduler=client) for ds in reopened_datasets]
             # block until all data is loaded.
             for ds in self.datasets:
                 dask.distributed.wait(ds)
         else:
-            self.datasets = [ds.load() for ds in self.datasets]
+            self.datasets = [ds.load() for ds in self._crop_to_chunks(self.datasets)]
 
     def query_input_points(self, chunk_cell_id: int | None) -> xr.Dataset | None:
         """Query input data points to resample as HEALPix cell data.
