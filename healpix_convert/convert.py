@@ -15,6 +15,7 @@ import structlog
 import xarray as xr
 import zarr.api.synchronous as zarr
 
+import healpix_convert.core.utils as utils
 from healpix_convert.cache import create_staging_cache
 from healpix_convert.core.conversion_models import ConvertStagingCache
 from healpix_convert.core.metadata import (
@@ -228,8 +229,13 @@ def _create_and_process_output(
         with ThreadPoolExecutor(max_workers=min(16, len(to_prepare))) as pool:
             list(
                 pool.map(
-                    lambda path: init_converter(
-                        path, cache=cache, settings=settings, output_store=output_store
+                    utils.retry_store_conflicts(
+                        lambda path: init_converter(
+                            path,
+                            cache=cache,
+                            settings=settings,
+                            output_store=output_store,
+                        )
                     ),
                     to_prepare,
                 )

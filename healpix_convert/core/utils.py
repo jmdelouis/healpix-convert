@@ -1,9 +1,13 @@
 """Utility methods used internally for converting datasets onto HEALPix."""
 
+import errno
+import random
 import re
+import time
 from collections import Counter
 from collections.abc import Iterable
-from typing import Any, Literal, cast
+from collections.abc import Callable
+from typing import Any, Literal, TypeVar, cast
 
 import affine
 import healpix_geo
@@ -385,3 +389,32 @@ def resolution_to_level(
     base = EARTH_RADIUS_M * np.sqrt(np.pi / 3.0)
     level = int(round_func(np.log2(base / resolution)))
     return level
+
+
+_T = TypeVar("_T")
+
+
+def retry_store_conflicts(
+    func: Callable[..., _T], *, attempts: int = 6, delay: float = 0.2
+) -> Callable[..., _T]:
+    """``func``, retried when the object store refuses a write because of a
+    concurrent conditional operation on the same key (S3 ``OperationAborted``,
+    which s3fs raises as an ``OSError`` with errno ``EBUSY``).
+
+    Zarr writes the metadata of the parent groups of a new node with a
+    conditional put: nodes created in threads under common parents conflict on
+    those keys. The creation of a node is idempotent, so it is just retried,
+    after a growing random delay.
+    """
+
+    def wrapped(*args: Any, **kwargs: Any) -> _T:
+        for attempt in range(attempts):
+            try:
+                return func(*args, **kwargs)
+            except OSError as e:
+                if e.errno != errno.EBUSY or attempt == attempts - 1:
+                    raise
+                time.sleep(delay * 2**attempt * (1.0 + random.random()))
+        raise AssertionError("unreachable")
+
+    return wrapped
