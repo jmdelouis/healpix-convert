@@ -40,6 +40,14 @@ from healpix_convert.core.metadata import (
     get_cf_grid_mapping_attrs,
     get_healpix_group_attrs,
 )
+from healpix_convert.pyramid import (
+    ChunkLocalTarget,
+    aggregate_chunk,
+    chunk_local_native_levels,
+    chunk_local_targets,
+    chunk_local_templates,
+    staging_arrays,
+)
 from healpix_convert.resampler_cache import build_resampler
 from healpix_convert.settings.common import (
     ConvertSettings,
@@ -269,8 +277,92 @@ class HealpixGroupConverter(ABC):
 
         self.output_arrays = self._get_arrays()
 
+        # the derived levels of the chunk-local pyramids that the chunks of
+        # this group aggregate (see healpix_convert.pyramid)
+        self.pyramid_targets: list[ChunkLocalTarget] = (
+            chunk_local_targets(cache, settings, self.output_path)
+            if isinstance(group_settings.chunk, HealpixDenseChunkSettings)
+            else []
+        )
+        self.pyramid_native_levels = (
+            chunk_local_native_levels(cache, self.output_path)
+            if self.pyramid_targets
+            else []
+        )
+        self.pyramid_templates: dict[str, xr.Variable] | None = None
+        self.pyramid_staging: dict | None = None
+
     def __post_init__(self):
         pass
+
+    def setup_chunk_local_pyramid(self) -> None:
+        """Read what the chunks need to aggregate the derived levels of the
+        chunk-local pyramids: their staging arrays and the value encoding of
+        their variables.
+
+        If the output dataset has no staging arrays (it was not prepared for
+        chunk-local pyramids), the chunks aggregate nothing and
+        :py:func:`~healpix_convert.generate_pyramids` aggregates the derived
+        levels from the converted ones.
+
+        """
+        if not self.pyramid_targets or self.pyramid_staging is not None:
+            return
+
+        assert isinstance(self.healpix.coordinate, str)
+        staging = staging_arrays(
+            self.output_store, self.pyramid_targets, self.healpix.coordinate
+        )
+        if staging is None:
+            self.pyramid_targets = []
+            return
+
+        self.pyramid_templates = chunk_local_templates(
+            self.output_store, self.pyramid_native_levels
+        )
+        self.pyramid_staging = staging
+
+    def _aggregate_pyramid_chunk(
+        self,
+        chunk_index: int,
+        cell_ids: np.ndarray,
+        written: Mapping[str, np.ndarray],
+    ) -> None:
+        """Aggregate the cells of one chunk onto the derived levels of the
+        chunk-local pyramids (``written``: the values written in the arrays of
+        this group, the arrays not written holding their fill value)."""
+        if not self.pyramid_targets:
+            return
+
+        self.setup_chunk_local_pyramid()
+        if not self.pyramid_targets:
+            return
+        assert self.pyramid_templates is not None
+        assert self.pyramid_staging is not None
+        assert isinstance(self.healpix.coordinate, str)
+
+        values = {self.healpix.coordinate: np.asarray(cell_ids, dtype=np.uint64)}
+        for name in self.spatial_info.spatial_arrays:
+            name = str(name)
+            zarray = self.output_arrays[name]
+            values[name] = written.get(
+                name,
+                np.full(
+                    (*zarray.shape[:-1], cell_ids.size),
+                    zarray.fill_value,
+                    dtype=zarray.dtype,
+                ),
+            )
+
+        aggregate_chunk(
+            self.output_arrays,
+            values,
+            chunk_index=chunk_index,
+            healpix=self.healpix,
+            targets=self.pyramid_targets,
+            templates=self.pyramid_templates,
+            staging=self.pyramid_staging,
+        )
 
     @property
     def cell_dim(self) -> str:
@@ -1056,6 +1148,7 @@ class DenseChunkConverter(UniformChunkConverter):
 
         # no input data point for current chunk
         if ds_input_points is None:
+            self._aggregate_pyramid_chunk(chunk_index, cell_ids, {})
             return
 
         resampler_settings = self.settings.resampler
@@ -1115,13 +1208,17 @@ class DenseChunkConverter(UniformChunkConverter):
         )
 
         writes = []
+        written = {}
         for name, cell_data in resampled.items():
             zarray = self.output_arrays[name]
             # cells without data (TODO: get the right fill_value and dtype)
             cell_data[np.isnan(cell_data)] = zarray.fill_value
-            writes.append((zarray, (..., chunk_slice), cell_data.astype(zarray.dtype)))
+            written[name] = cell_data.astype(zarray.dtype)
+            writes.append((zarray, (..., chunk_slice), written[name]))
 
         _write_chunk_arrays(writes)
+
+        self._aggregate_pyramid_chunk(chunk_index, cell_ids, written)
 
 
 class SparseChunkConverter(UniformChunkConverter):
