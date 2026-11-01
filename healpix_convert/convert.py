@@ -32,7 +32,12 @@ from healpix_convert.healpix_converters import (
     HealpixGroupConverter,
     init_converter,
 )
-from healpix_convert.pyramid import create_derived_level_groups, write_derived_levels
+from healpix_convert.pyramid import (
+    assemble_chunk_local_levels,
+    create_derived_level_arrays,
+    create_derived_level_groups,
+    write_derived_levels,
+)
 from healpix_convert.settings.common import (
     ConvertSettings,
     validate_convert_settings,
@@ -59,6 +64,10 @@ def _convert_group_to_healpix(
         return
 
     log.info(f"chunking output data using {converter.settings.chunk.method!r} method")
+
+    # read once here what the chunks need to aggregate the derived levels of
+    # the chunk-local pyramids, if any
+    converter.setup_chunk_local_pyramid()
 
     try:
         client = distributed.Client.current()
@@ -178,6 +187,11 @@ def _create_and_process_output(
 
     dt0 = next(iter(cache.input_datatrees.values()))
 
+    # the groups are converted once all the arrays of the output dataset are
+    # created, the ones of the derived levels included: the chunks of a group
+    # may aggregate the derived levels of its pyramid (chunk-local pyramids)
+    converters = []
+
     for path in dt0.groups:
         path = PurePath(path.lstrip("/"))
 
@@ -201,11 +215,11 @@ def _create_and_process_output(
             )
         elif path in cache.input_spatial_groups:
             log.info(f"••• writing group '{group_path_rel}' to zarr")
-            converter = init_converter(
-                path, cache=cache, settings=settings, output_store=output_store
+            converters.append(
+                init_converter(
+                    path, cache=cache, settings=settings, output_store=output_store
+                )
             )
-            if convert_data:
-                _convert_group_to_healpix(converter)
         elif not dt0[str(path)].has_data:
             zarr.create_group(output_store, path=group_path_rel)
         else:
@@ -220,13 +234,27 @@ def _create_and_process_output(
         log.info("••• creating the derived level groups...")
         create_derived_level_groups(output_store, cache, settings)
 
-        if convert_data:
-            write_derived_levels(
+        if not dry_run:
+            create_derived_level_arrays(
                 output_store,
                 cache,
                 settings,
                 output_storage_options=output_storage_options,
             )
+
+    if convert_data:
+        for converter in converters:
+            _convert_group_to_healpix(converter)
+
+    if convert_data and settings.multiscale_settings.pyramid_groups:
+        assembled = assemble_chunk_local_levels(output_store, cache, settings)
+        write_derived_levels(
+            output_store,
+            cache,
+            settings,
+            output_storage_options=output_storage_options,
+            skip=assembled,
+        )
 
     # --- finalize the output dataset
     if convert_data:
@@ -274,7 +302,9 @@ def prepare_healpix_dataset(
 
     The groups of the derived levels of the pyramids and the multiscales
     metadata describing them are created as well; their arrays are written by
-    :py:func:`generate_pyramids`.
+    :py:func:`generate_pyramids`. The arrays of the chunk-local pyramids
+    (see :py:mod:`healpix_convert.pyramid`) are created here, with the staging
+    arrays that the chunk conversion fills.
 
     Useful for multi-stage conversion workflows:
 
@@ -457,11 +487,15 @@ def generate_pyramids(
         root_group = zarr.open_group(
             output_path, mode="a", storage_options=output_storage_options
         )
+        # the derived levels the chunk conversion tasks have aggregated
+        # (chunk-local pyramids), then the others, from the converted levels
+        assembled = assemble_chunk_local_levels(root_group.store, cache, settings)
         write_derived_levels(
             root_group.store,
             cache,
             settings,
             output_storage_options=output_storage_options,
+            skip=assembled,
         )
 
         log.info("••• done!")
