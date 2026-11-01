@@ -44,6 +44,7 @@ be grouped and no cell id is ever read.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Collection, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import PurePath
@@ -56,6 +57,9 @@ import xarray as xr
 import zarr.api.synchronous as zarr
 import zarr.storage
 from xarray.backends.zarr import encode_zarr_variable
+from zarr.core.buffer import default_buffer_prototype
+from zarr.core.common import ZARR_JSON
+from zarr.core.sync import sync
 
 import healpix_convert.core.utils as utils
 from healpix_convert.cache import _derived_level_sources
@@ -644,31 +648,42 @@ def _decoded_chunk(
     arrays: Mapping[str, zarr.Array], values: Mapping[str, np.ndarray]
 ) -> xr.Dataset:
     """The cells of one converted chunk as :py:func:`write_derived_levels`
-    reads them from the converted level: the values written in ``arrays``,
-    decoded by Xarray from an in-memory copy of those arrays."""
+    reads them back from the converted level.
+
+    ``values`` (the values written in ``arrays`` for this chunk) go through an
+    in-memory copy of the arrays with their metadata (codecs and chunks
+    included): a lossy codec gives back the values it decodes from the store,
+    and Xarray decodes them as it decodes the converted level, into Dask arrays
+    chunked like it.
+
+    """
     store = zarr.storage.MemoryStore()
-    group = zarr.open_group(store, mode="w", zarr_format=3)
+    zarr.open_group(store, mode="w", zarr_format=3)
+    prototype = default_buffer_prototype()
 
     for name, value in values.items():
-        array = arrays[name]
-        copy = group.create_array(
-            name,
-            shape=value.shape,
-            dtype=array.dtype,
-            chunks=value.shape,
-            fill_value=array.fill_value,
-            dimension_names=array.metadata.dimension_names,
-            attributes=dict(array.attrs),
+        metadata = json.loads(
+            arrays[name].metadata.to_buffer_dict(prototype)[ZARR_JSON].to_bytes()
         )
-        copy[...] = value
+        # the chunk only: the same chunks, codecs, fill value and attributes
+        metadata["shape"] = list(value.shape)
+        sync(
+            store.set(
+                f"{name}/{ZARR_JSON}",
+                prototype.buffer.from_bytes(json.dumps(metadata).encode()),
+            )
+        )
+        zarr.open_array(store, path=name, mode="r+")[...] = value
 
+    # Dask arrays with the chunks of the converted level, as it is read back:
+    # a block of cells spanning several of them is reduced chunk by chunk
     return xr.open_dataset(
         store,  # type: ignore[arg-type]
         engine="zarr",
         consolidated=False,
-        chunks=None,
+        chunks={},
         **_DECODE_KWARGS,
-    ).load()
+    )
 
 
 def aggregate_chunk(
@@ -699,7 +714,7 @@ def aggregate_chunk(
             healpix=healpix,
             reduce=target.reduce,  # type: ignore[arg-type]
         )
-        coarse = encode_like(coarse, templates)
+        coarse = encode_like(coarse, templates).compute(scheduler="synchronous")
         n_cells = coarse.sizes[healpix.spatial_dimension]
         region = slice(chunk_index * n_cells, (chunk_index + 1) * n_cells)
 
