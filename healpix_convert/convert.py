@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import PurePath
 from typing import Any
 
@@ -190,7 +191,7 @@ def _create_and_process_output(
     # the groups are converted once all the arrays of the output dataset are
     # created, the ones of the derived levels included: the chunks of a group
     # may aggregate the derived levels of its pyramid (chunk-local pyramids)
-    converters = []
+    spatial_paths: list[PurePath] = []
 
     for path in dt0.groups:
         path = PurePath(path.lstrip("/"))
@@ -215,11 +216,7 @@ def _create_and_process_output(
             )
         elif path in cache.input_spatial_groups:
             log.info(f"••• writing group '{group_path_rel}' to zarr")
-            converters.append(
-                init_converter(
-                    path, cache=cache, settings=settings, output_store=output_store
-                )
-            )
+            spatial_paths.append(path)
         elif not dt0[str(path)].has_data:
             zarr.create_group(output_store, path=group_path_rel)
         else:
@@ -227,6 +224,21 @@ def _create_and_process_output(
             log.warning(
                 f"••• skip writing non-spatial group '{group_path_rel}' to zarr "
                 "(not yet supported)"
+            )
+
+    # creating the arrays of a group is a few store round trips per array
+    # (about 0.5 s per array on object storage): the converters of the groups
+    # are initialised in threads, so that these round trips overlap
+    converters = []
+    if spatial_paths:
+        with ThreadPoolExecutor(max_workers=min(16, len(spatial_paths))) as pool:
+            converters = list(
+                pool.map(
+                    lambda path: init_converter(
+                        path, cache=cache, settings=settings, output_store=output_store
+                    ),
+                    spatial_paths,
+                )
             )
 
     # --- derived levels (the coarser levels of the pyramid multiscale groups)
