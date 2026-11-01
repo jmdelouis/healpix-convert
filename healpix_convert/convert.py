@@ -528,7 +528,12 @@ def _write_derived_levels_in_memory(
 
     fs, root = fsspec.core.url_to_fs(output_path, **(output_storage_options or {}))
     root = root.rstrip("/")
+    # a listing cached by the file system (fsspec shares its instances) may
+    # miss the objects just written: list the store afresh
+    fs.invalidate_cache(root)
     keys = fs.find(root)
+    if f"{root}/zarr.json" not in keys:
+        raise RuntimeError(f"{output_path}: no root group metadata in the listing")
     log.info(f"••• reading the {len(keys)} objects of the output dataset into memory...")
     contents = fs.cat(keys)  # concurrent on async file systems (e.g. S3)
     before = {key[len(root) + 1 :]: value for key, value in contents.items()}
