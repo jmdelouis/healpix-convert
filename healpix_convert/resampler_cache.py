@@ -44,6 +44,15 @@ CACHE_DIR_ENV = "HEALPIX_CONVERT_RESAMPLER_CACHE"
 CACHE_METHODS_ENV = "HEALPIX_CONVERT_RESAMPLER_CACHE_METHODS"
 NEIGHBOUR_STORE_ENV = "HEALPIX_CONVERT_NEIGHBOUR_STORE"
 NEIGHBOUR_STORE_OPTIONS_ENV = "HEALPIX_CONVERT_NEIGHBOUR_STORE_OPTIONS"
+LINKS_ONLY_ENV = "HEALPIX_CONVERT_LINKS_ONLY"
+
+
+def links_only() -> bool:
+    """``HEALPIX_CONVERT_LINKS_ONLY=1``: a conversion only fills the neighbour
+    links store (the chunks build their resamplers, nothing is resampled):
+    a pass that searches the neighbours of every geometry ahead of the
+    conversions."""
+    return os.environ.get(LINKS_ONLY_ENV, "") not in ("", "0")
 
 
 def _cache_dir(method: str) -> str | None:
@@ -178,6 +187,14 @@ def build_resampler(resampler_cls: type, method: str, **kwargs: Any) -> Any:
     """``resampler_cls(**kwargs)``, from the resampler cache when it is on
     for ``method``, else from the neighbour links store when it is on (see
     the module docstring)."""
+    if links_only():
+        # the neighbour links of the resamplers that search them, stored
+        if _neighbour_store(resampler_cls) is not None and kwargs.get("search") != "kdtree":
+            fs, root = _neighbour_store(resampler_cls)
+            if not fs.exists(f"{root}/{resampler_key(resampler_cls, kwargs)}.links"):
+                _build_with_links(resampler_cls, kwargs)
+        return None
+
     directory = _cache_dir(method)
     if directory is None:
         return _build_with_links(resampler_cls, kwargs)

@@ -1095,6 +1095,8 @@ class DenseChunkConverter(UniformChunkConverter):
             ellipsoid=self.healpix.ellipsoid.name,
             **dict(resampler_settings.init_params),
         )
+        if resampler is None:  # links-only pass (see resampler_cache.links_only)
+            return
         # resample arrays (data variables)
         var_names = [
             str(name)
@@ -1183,6 +1185,8 @@ class SparseChunkConverter(UniformChunkConverter):
             ellipsoid=self.healpix.ellipsoid.name,
             **dict(resampler_settings.init_params),
         )
+        if resampler is None:  # links-only pass (see resampler_cache.links_only)
+            return
 
         cell_ids = resampler.get_cell_ids()
         start = chunk_index * self.cell_dim_chunk_size
@@ -1331,6 +1335,8 @@ class NoChunkConverter(HealpixGroupConverter):
             ellipsoid=self.ellipsoid,
             **dict(resampler_settings.init_params),
         )
+        if resampler is None:  # links-only pass (see resampler_cache.links_only)
+            return
         # resample arrays (data variables)
         var_names = [
             str(name)
