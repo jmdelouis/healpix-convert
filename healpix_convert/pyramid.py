@@ -103,6 +103,7 @@ def write_derived_levels(
     output_storage_options: dict[str, Any] | None = None,
     direct: bool = False,
     loader: Callable[[str], np.ndarray] | None = None,
+    pool: Any = None,
 ) -> None:
     """Aggregate the converted data onto the derived levels of the pyramids
     and write it in their groups, creating their arrays.
@@ -113,7 +114,11 @@ def write_derived_levels(
     block sums and counts of the finer ones (see :py:class:`_BlockMeans`).
     Same block means, summed in another order. ``loader``, if given, returns
     the decoded values of a converted array from its path in the store (e.g.
-    decoded in other processes), instead of reading it through Xarray.
+    decoded in other processes), instead of reading it through Xarray. With
+    ``pool`` (a ``concurrent.futures`` executor) and an in-memory
+    ``output_store``, the data variables of the derived levels are encoded
+    shard by shard in its processes (the codecs hold the GIL), through Zarr
+    with the metadata Xarray created, so the stored objects are the same.
 
     The groups themselves and the multiscales metadata of the groups holding
     them are written by :py:func:`create_derived_level_groups`. The converted
@@ -158,18 +163,28 @@ def write_derived_levels(
         for level_path, ds in _build_derived_levels(
             dt, info, pyramid, settings, direct=direct, loader=loader
         ).items():
-            writes.append(
-                ds.to_zarr(
-                    output_store,
-                    group=level_path.as_posix(),
-                    mode="a",
-                    zarr_format=3,
-                    # the Zarr metadata of the output dataset is consolidated
-                    # once, by the conversion stage that calls this
-                    consolidated=False,
-                    compute=False,
-                )
+            to_zarr = dict(
+                group=level_path.as_posix(),
+                mode="a",
+                zarr_format=3,
+                # the Zarr metadata of the output dataset is consolidated
+                # once, by the conversion stage that calls this
+                consolidated=False,
+                compute=False,
             )
+            if pool is None:
+                writes.append(ds.to_zarr(output_store, **to_zarr))
+                continue
+            # the arrays and their metadata as Xarray writes them; their data
+            # (the variables on the cells) encoded in the processes of the pool
+            dim = info.derived_levels[level_path][0].spatial_dimension
+            cell_vars = [str(n) for n, v in ds.data_vars.items() if dim in v.dims]
+            ds.to_zarr(output_store, **to_zarr)
+            writes.append(ds.drop_vars(cell_vars).to_zarr(output_store, **to_zarr))
+            for name in cell_vars:
+                _encode_in_processes(
+                    output_store, f"{level_path.as_posix()}/{name}", ds[name].variable, pool
+                )
 
     # all the levels are written in one Dask computation: a converted level is
     # read once and feeds every level aggregated from it
@@ -547,3 +562,49 @@ def decode_arrays_in_processes(
         return values
 
     return load
+
+
+def _encode_shard(meta: bytes, coords: tuple[int, ...], values: np.ndarray) -> tuple[str, bytes | None]:
+    """The stored object of one shard of an array (``coords`` in the chunk
+    grid) holding ``values``, encoded by Zarr from the array metadata (run in
+    another process); ``None`` if Zarr does not store it (empty shard)."""
+    from zarr.core.buffer import default_buffer_prototype
+    from zarr.storage import MemoryStore
+
+    proto = default_buffer_prototype()
+    store = MemoryStore({"zarr.json": proto.buffer.from_bytes(meta)})
+    array = zarr.open_array(store, mode="r+")
+    shape = array.metadata.chunk_grid.chunk_shape
+    array[tuple(slice(c * s, c * s + n) for c, s, n in zip(coords, shape, values.shape))] = values
+    key = "c/" + "/".join(str(c) for c in coords)
+    stored = store._store_dict.get(key)
+    return key, None if stored is None else stored.to_bytes()
+
+
+def _encode_in_processes(store: Any, path: str, variable: xr.Variable, pool: Any) -> None:
+    """Write the data of ``variable`` in the array ``path`` of the in-memory
+    ``store`` (created by Xarray), as Xarray would, its shards encoded in the
+    processes of ``pool``."""
+    from xarray.backends.zarr import encode_zarr_variable
+    from zarr.core.buffer import default_buffer_prototype
+
+    values = np.asarray(encode_zarr_variable(variable).values)
+    meta = store._store_dict[f"{path}/zarr.json"].to_bytes()
+    shard = json.loads(meta)["chunk_grid"]["configuration"]["chunk_shape"]
+    grid = [-(-n // s) for n, s in zip(values.shape, shard)]
+    futures = [
+        pool.submit(
+            _encode_shard,
+            meta,
+            coords,
+            values[tuple(slice(c * s, (c + 1) * s) for c, s in zip(coords, shard))],
+        )
+        for coords in np.ndindex(*grid)
+    ]
+    proto = default_buffer_prototype()
+    for future in futures:
+        key, data = future.result()
+        if data is None:
+            store._store_dict.pop(f"{path}/{key}", None)
+        else:
+            store._store_dict[f"{path}/{key}"] = proto.buffer.from_bytes(data)

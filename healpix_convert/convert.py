@@ -551,17 +551,23 @@ def _write_derived_levels_in_memory(
 
     from healpix_convert.pyramid import decode_arrays_in_processes
 
-    with ProcessPoolExecutor(
+    pool = ProcessPoolExecutor(
         max_workers=os.cpu_count() or 1,
         mp_context=multiprocessing.get_context("spawn"),
-    ) as pool, dask.config.set(scheduler="threads"):
-        write_derived_levels(
-            memory,
-            cache,
-            settings,
-            direct=True,
-            loader=decode_arrays_in_processes(before, pool),
-        )
+    )
+    try:
+        with dask.config.set(scheduler="threads"):
+            write_derived_levels(
+                memory,
+                cache,
+                settings,
+                direct=True,
+                loader=decode_arrays_in_processes(before, pool),
+                pool=pool,
+            )
+    finally:
+        # every result is in: do not wait for the processes to exit
+        pool.shutdown(wait=False, cancel_futures=True)
 
     after = {key: value.to_bytes() for key, value in memory._store_dict.items()}
     changed = {
