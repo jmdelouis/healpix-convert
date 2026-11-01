@@ -27,11 +27,13 @@ be grouped and no cell id is ever read.
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import Callable, Mapping
 from pathlib import PurePath
 from typing import Any
 
 import dask
+import dask.array
 import numpy as np
 import structlog
 import xarray as xr
@@ -501,7 +503,11 @@ class _BlockMeans:
             if np.issubdtype(var.dtype, np.integer):
                 fill_value = var.encoding.get("fill_value")
                 mean = np.round(np.where(np.isnan(mean), 0 if fill_value is None else fill_value, mean))
-            part[name] = var.copy(data=mean.astype(var.dtype))
+            # a named Dask array: Dask would otherwise hash the values to name it
+            data = dask.array.from_array(
+                mean.astype(var.dtype), chunks=-1, name=f"block-means-{uuid.uuid4().hex}"
+            )
+            part[name] = var.copy(data=data)
         return part
 
 
