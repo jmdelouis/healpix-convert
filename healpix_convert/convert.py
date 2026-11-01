@@ -431,6 +431,7 @@ def generate_pyramids(
     output_path: str,
     *,
     output_storage_options: dict[str, Any] | None = None,
+    in_memory: bool = False,
 ) -> xr.DataTree:
     """Aggregate the converted data onto the coarser HEALPix refinement levels
     of the pyramids.
@@ -459,6 +460,12 @@ def generate_pyramids(
     output_storage_options : dict, optional
         Storage options passed to Zarr for reading the converted dataset and
         writing the pyramids (useful for, e.g., writing on S3 object store).
+    in_memory : bool, optional
+        Read the whole output dataset once (all its objects, concurrently),
+        aggregate the pyramids on that copy in memory, and write the derived
+        levels back at once (default: False, read and write the store as the
+        aggregation goes). Same computation, same result; on object storage
+        the aggregation otherwise waits on many small reads.
 
     Returns
     -------
@@ -479,6 +486,9 @@ def generate_pyramids(
 
     if not settings.multiscale_settings.pyramid_groups:
         log.info("••• no group with pyramid settings: nothing to generate.")
+    elif in_memory:
+        _write_derived_levels_in_memory(output_path, cache, settings, output_storage_options)
+        log.info("••• done!")
     else:
         root_group = zarr.open_group(
             output_path, mode="a", storage_options=output_storage_options
@@ -502,6 +512,47 @@ def generate_pyramids(
         chunks="auto",
         consolidated=False,
     )
+
+
+def _write_derived_levels_in_memory(
+    output_path: str,
+    cache: ConvertStagingCache,
+    settings: ConvertSettings,
+    output_storage_options: dict[str, Any] | None,
+) -> None:
+    """:py:func:`write_derived_levels` on an in-memory copy of the output
+    dataset, then the new and changed objects written back at once."""
+    import fsspec
+    from zarr.core.buffer import default_buffer_prototype
+    from zarr.storage import MemoryStore
+
+    fs, root = fsspec.core.url_to_fs(output_path, **(output_storage_options or {}))
+    root = root.rstrip("/")
+    keys = fs.find(root)
+    log.info(f"••• reading the {len(keys)} objects of the output dataset into memory...")
+    contents = fs.cat(keys)  # concurrent on async file systems (e.g. S3)
+    before = {key[len(root) + 1 :]: value for key, value in contents.items()}
+
+    proto = default_buffer_prototype()
+    memory = MemoryStore(
+        {key: proto.buffer.from_bytes(value) for key, value in before.items()}
+    )
+    # the same Dask graph as on the store; its tasks read the in-memory copy,
+    # so they run in threads of this process
+    with dask.config.set(scheduler="threads"):
+        write_derived_levels(memory, cache, settings)
+
+    after = {key: value.to_bytes() for key, value in memory._store_dict.items()}
+    changed = {
+        f"{root}/{key}": value
+        for key, value in after.items()
+        if before.get(key) != value
+    }
+    removed = [f"{root}/{key}" for key in before if key not in after]
+    log.info(f"••• writing {len(changed)} objects of the derived levels at once...")
+    fs.pipe(changed)  # concurrent on async file systems
+    if removed:
+        fs.rm(removed)
 
 
 def finalize_healpix_dataset(
