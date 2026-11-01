@@ -26,11 +26,13 @@ be grouped and no cell id is ever read.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import json
+from collections.abc import Callable, Mapping
 from pathlib import PurePath
 from typing import Any
 
 import dask
+import numpy as np
 import structlog
 import xarray as xr
 import zarr.api.synchronous as zarr
@@ -99,9 +101,19 @@ def write_derived_levels(
     settings: ConvertSettings,
     *,
     output_storage_options: dict[str, Any] | None = None,
+    direct: bool = False,
+    loader: Callable[[str], np.ndarray] | None = None,
 ) -> None:
     """Aggregate the converted data onto the derived levels of the pyramids
     and write it in their groups, creating their arrays.
+
+    With ``direct``, the block means (``reduce="mean"``) are computed in numpy
+    rather than by one Dask graph per derived level: each converted variable
+    is read (decoded) once, and every derived level is aggregated from the
+    block sums and counts of the finer ones (see :py:class:`_BlockMeans`).
+    Same block means, summed in another order. ``loader``, if given, returns
+    the decoded values of a converted array from its path in the store (e.g.
+    decoded in other processes), instead of reading it through Xarray.
 
     The groups themselves and the multiscales metadata of the groups holding
     them are written by :py:func:`create_derived_level_groups`. The converted
@@ -144,7 +156,7 @@ def write_derived_levels(
         )
 
         for level_path, ds in _build_derived_levels(
-            dt, info, pyramid, settings
+            dt, info, pyramid, settings, direct=direct, loader=loader
         ).items():
             writes.append(
                 ds.to_zarr(
@@ -219,6 +231,9 @@ def _build_derived_levels(
     info: PyramidMultiscaleGroupInfo,
     pyramid: PyramidSettings,
     settings: ConvertSettings,
+    *,
+    direct: bool = False,
+    loader: Callable[[str], np.ndarray] | None = None,
 ) -> dict[PurePath, xr.Dataset]:
     """Build the datasets of the derived levels of one pyramid multiscale group
     (group path -> dataset).
@@ -236,6 +251,19 @@ def _build_derived_levels(
             templates.setdefault(name, var)
 
     derived = {}
+    means = (
+        _BlockMeans(
+            datasets,
+            native_healpix,
+            loader=loader,
+            paths={
+                healpix.refinement_level: path.as_posix()
+                for path, (healpix, _) in info.native_levels.items()
+            },
+        )
+        if direct and pyramid.reduce == "mean"
+        else None
+    )
 
     for level_path, (healpix, chunk_level) in info.derived_levels.items():
         assert healpix.refinement_level is not None
@@ -248,6 +276,7 @@ def _build_derived_levels(
             templates=templates,
             # a chunk holds the children of one HEALPix cell of the chunk level
             chunk_size=4 ** (healpix.refinement_level - chunk_level),
+            means=means,
         )
         ds = _set_cf_grid_mapping(ds, healpix)
         ds.attrs = get_healpix_group_attrs(healpix, settings.metadata)
@@ -264,6 +293,7 @@ def _build_derived_level(
     pyramid: PyramidSettings,
     templates: Mapping[str, xr.Variable],
     chunk_size: int,
+    means: _BlockMeans | None = None,
 ) -> xr.Dataset:
     """Build the dataset of one derived level, from the converted levels of its
     multiscale group.
@@ -275,14 +305,15 @@ def _build_derived_level(
     parts = []
 
     for source, names in sources.items():
-        parts.append(
-            coarsen_healpix_group(
-                datasets[source][names],
-                level,
-                healpix=native_healpix[source],
-                reduce=pyramid.reduce,
-            )
+        part = coarsen_healpix_group(
+            datasets[source][names],
+            level,
+            healpix=native_healpix[source],
+            reduce=pyramid.reduce,
         )
+        if means is not None:
+            part = means.fill(part, source, level)
+        parts.append(part)
 
     if len(parts) == 1:
         ds = parts[0]
@@ -389,3 +420,130 @@ def _set_cf_grid_mapping(ds: xr.Dataset, healpix: Healpix) -> xr.Dataset:
     ).model_dump()
 
     return ds
+
+
+class _BlockMeans:
+    """Block means of the converted variables of a pyramid multiscale group,
+    computed in numpy: each variable is read once from its converted level,
+    and the sums and the counts of its valid (non-NaN) cells are aggregated
+    four children at a time, level after level, so that every derived level
+    is the block mean of the converted cells it covers, as
+    :py:func:`~healpix_convert.core.coarsen.coarsen_healpix_group` computes it
+    (``reduce="mean"``), with the sums in another order.
+    """
+
+    def __init__(
+        self,
+        datasets: Mapping[int, xr.Dataset],
+        native_healpix: Mapping[int, Healpix],
+        *,
+        loader: Callable[[str], np.ndarray] | None = None,
+        paths: Mapping[int, str] | None = None,
+    ):
+        self.datasets = datasets
+        self.native_healpix = native_healpix
+        self.loader = loader
+        self.paths = paths or {}
+        # (variable, converted level, level) -> (sums, counts), cell axis last
+        self.sums: dict[tuple[str, int, int], tuple[np.ndarray, np.ndarray]] = {}
+
+    def _sums(self, name: str, source: int, level: int) -> tuple[np.ndarray, np.ndarray]:
+        key = (name, source, level)
+        if key not in self.sums:
+            if level == source:
+                var = self.datasets[source][name]
+                axis = var.dims.index(self.native_healpix[source].spatial_dimension)
+                if self.loader is not None and source in self.paths:
+                    data = self.loader(f"{self.paths[source]}/{name}")
+                else:
+                    data = var.values
+                values = np.moveaxis(np.asarray(data, dtype=np.float64), axis, -1)
+                valid = ~np.isnan(values)
+                self.sums[key] = (np.where(valid, values, 0.0), valid.astype(np.int64))
+            else:
+                sums, counts = self._sums(name, source, level + 1)
+                shape = (*sums.shape[:-1], sums.shape[-1] // 4, 4)
+                self.sums[key] = (
+                    sums.reshape(shape).sum(axis=-1),
+                    counts.reshape(shape).sum(axis=-1),
+                )
+        return self.sums[key]
+
+    def fill(self, part: xr.Dataset, source: int, level: int) -> xr.Dataset:
+        """``part`` (one coarsened source of a derived level, with lazy data)
+        with the data of its variables on the cells replaced by the block
+        means, cast as :py:func:`~healpix_convert.core.coarsen.encode_like`
+        casts them."""
+        dim = self.native_healpix[source].spatial_dimension
+        part = part.copy()
+        for name, var in part.data_vars.items():
+            if dim not in var.dims:
+                continue
+            sums, counts = self._sums(str(name), source, level)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                mean = np.where(counts > 0, sums / np.maximum(counts, 1), np.nan)
+            mean = np.moveaxis(mean, -1, var.dims.index(dim))
+            if np.issubdtype(var.dtype, np.integer):
+                fill_value = var.encoding.get("fill_value")
+                mean = np.round(np.where(np.isnan(mean), 0 if fill_value is None else fill_value, mean))
+            part[name] = var.copy(data=mean.astype(var.dtype))
+        return part
+
+
+def _decode_shard(meta: bytes, key: str, data: bytes) -> tuple[str, np.ndarray]:
+    """The decoded values of one chunk object (a shard) of an array, from the
+    array metadata and the object, through Zarr (run in another process)."""
+    from zarr.core.buffer import default_buffer_prototype
+    from zarr.storage import MemoryStore
+
+    proto = default_buffer_prototype()
+    store = MemoryStore(
+        {"zarr.json": proto.buffer.from_bytes(meta), key: proto.buffer.from_bytes(data)}
+    )
+    array = zarr.open_array(store, mode="r")
+    shape = array.metadata.chunk_grid.chunk_shape
+    coords = [int(c) for c in key.split("/")[1:]]
+    selection = tuple(
+        slice(c * s, min((c + 1) * s, n)) for c, s, n in zip(coords, shape, array.shape)
+    )
+    return key, array[selection]
+
+
+def decode_arrays_in_processes(
+    objects: Mapping[str, bytes], pool: Any
+) -> Callable[[str], np.ndarray]:
+    """A loader for :py:func:`write_derived_levels`: the decoded values of an
+    array of the in-memory dataset ``objects`` (key -> bytes), its chunk
+    objects decoded by Zarr in the processes of ``pool`` (a
+    ``concurrent.futures`` executor), with the cells holding the fill value
+    as NaN, as Xarray reads them. Arrays whose chunk keys are not of the
+    default ``c/...`` form are not handled (``KeyError``)."""
+
+    def load(path: str) -> np.ndarray:
+        meta = objects[f"{path}/zarr.json"]
+        info = json.loads(meta)
+        if info.get("chunk_key_encoding", {}).get("name", "default") != "default":
+            raise KeyError(path)
+        prefix = f"{path}/c/"
+        keys = [key for key in objects if key.startswith(prefix)]
+        dtype = np.dtype(np.float64 if "float" in str(info["data_type"]) else info["data_type"])
+        fill = info.get("fill_value")
+        out = np.full(info["shape"], np.nan if fill in (None, "NaN") else fill, dtype=dtype)
+        futures = [
+            pool.submit(_decode_shard, meta, key[len(path) + 1 :], objects[key])
+            for key in keys
+        ]
+        shape = None
+        for future in futures:
+            key, values = future.result()
+            if shape is None:
+                shape = values.shape if values.ndim else ()
+            coords = [int(c) for c in key.split("/")[1:]]
+            chunk = info["chunk_grid"]["configuration"]["chunk_shape"]
+            out[tuple(slice(c * s, c * s + n) for c, s, n in zip(coords, chunk, values.shape))] = values
+        values = out.astype(np.float64)
+        if fill not in (None, "NaN") and np.issubdtype(out.dtype, np.number):
+            values[out == fill] = np.nan
+        return values
+
+    return load

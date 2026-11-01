@@ -542,10 +542,26 @@ def _write_derived_levels_in_memory(
     memory = MemoryStore(
         {key: proto.buffer.from_bytes(value) for key, value in before.items()}
     )
-    # the same Dask graph as on the store; its tasks read the in-memory copy,
-    # so they run in threads of this process
-    with dask.config.set(scheduler="threads"):
-        write_derived_levels(memory, cache, settings)
+    # the converted arrays are decoded in other processes (the codecs hold
+    # the GIL), their block means computed in numpy, and the rest of the
+    # derived levels (cell ids) by Dask in threads of this process
+    import multiprocessing
+    import os
+    from concurrent.futures import ProcessPoolExecutor
+
+    from healpix_convert.pyramid import decode_arrays_in_processes
+
+    with ProcessPoolExecutor(
+        max_workers=os.cpu_count() or 1,
+        mp_context=multiprocessing.get_context("spawn"),
+    ) as pool, dask.config.set(scheduler="threads"):
+        write_derived_levels(
+            memory,
+            cache,
+            settings,
+            direct=True,
+            loader=decode_arrays_in_processes(before, pool),
+        )
 
     after = {key: value.to_bytes() for key, value in memory._store_dict.items()}
     changed = {
