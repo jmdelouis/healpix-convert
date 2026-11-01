@@ -642,8 +642,8 @@ def create_derived_level_arrays(
             )
 
     with ThreadPoolExecutor(max_workers=16) as pool:
-        list(pool.map(create_level, levels))
-        list(pool.map(create_staging, staging))
+        list(pool.map(utils.retry_store_conflicts(create_level), levels))
+        list(pool.map(utils.retry_store_conflicts(create_staging), staging))
 
     for path in groups:
         log.info(
