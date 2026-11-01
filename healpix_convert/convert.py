@@ -14,6 +14,7 @@ import shapely
 import structlog
 import xarray as xr
 import zarr.api.synchronous as zarr
+from zarr.storage import MemoryStore
 
 import healpix_convert.core.utils as utils
 from healpix_convert.cache import create_staging_cache
@@ -514,6 +515,17 @@ def generate_pyramids(
     )
 
 
+# processes of the in-memory pyramids (see _write_derived_levels_in_memory)
+_PYRAMID_POOL = None
+
+
+@dask.base.normalize_token.register(MemoryStore)
+def _tokenize_memory_store(store: MemoryStore) -> tuple[str, int]:
+    """Dask names the writes to an in-memory store after the store itself:
+    by identity, not by hashing all the objects it holds."""
+    return ("zarr-memory-store", id(store))
+
+
 def _write_derived_levels_in_memory(
     output_path: str,
     cache: ConvertStagingCache,
@@ -524,7 +536,6 @@ def _write_derived_levels_in_memory(
     dataset, then the new and changed objects written back at once."""
     import fsspec
     from zarr.core.buffer import default_buffer_prototype
-    from zarr.storage import MemoryStore
 
     fs, root = fsspec.core.url_to_fs(output_path, **(output_storage_options or {}))
     root = root.rstrip("/")
@@ -551,23 +562,23 @@ def _write_derived_levels_in_memory(
 
     from healpix_convert.pyramid import decode_arrays_in_processes
 
-    pool = ProcessPoolExecutor(
-        max_workers=os.cpu_count() or 1,
-        mp_context=multiprocessing.get_context("spawn"),
-    )
-    try:
-        with dask.config.set(scheduler="threads"):
-            write_derived_levels(
-                memory,
-                cache,
-                settings,
-                direct=True,
-                loader=decode_arrays_in_processes(before, pool),
-                pool=pool,
-            )
-    finally:
-        # every result is in: do not wait for the processes to exit
-        pool.shutdown(wait=False, cancel_futures=True)
+    global _PYRAMID_POOL
+    if _PYRAMID_POOL is None:
+        # kept for the next datasets: starting the processes (importing
+        # this package in each) costs more than a dataset's work
+        _PYRAMID_POOL = ProcessPoolExecutor(
+            max_workers=os.cpu_count() or 1,
+            mp_context=multiprocessing.get_context("spawn"),
+        )
+    with dask.config.set(scheduler="threads"):
+        write_derived_levels(
+            memory,
+            cache,
+            settings,
+            direct=True,
+            loader=decode_arrays_in_processes(before, _PYRAMID_POOL),
+            pool=_PYRAMID_POOL,
+        )
 
     after = {key: value.to_bytes() for key, value in memory._store_dict.items()}
     changed = {
