@@ -40,6 +40,7 @@ from healpix_convert.core.metadata import (
     get_cf_grid_mapping_attrs,
     get_healpix_group_attrs,
 )
+from healpix_convert.resampler_cache import build_resampler
 from healpix_convert.settings.common import (
     ConvertSettings,
     ExtraDimensionSettings,
@@ -1081,7 +1082,9 @@ class DenseChunkConverter(UniformChunkConverter):
             lat_deg = ds_input_points.lat.values
 
         log.debug("initialize resampler")
-        resampler = resampler_cls(
+        resampler = build_resampler(
+            resampler_cls,
+            resampler_settings.name,
             lon_deg=lon_deg,
             lat_deg=lat_deg,
             level=self.healpix.refinement_level,
@@ -1168,7 +1171,9 @@ class SparseChunkConverter(UniformChunkConverter):
         # TODO: pass array dtype to resampler
         # in case all arrays to resample have the same dtype
 
-        resampler = resampler_cls(
+        resampler = build_resampler(
+            resampler_cls,
+            resampler_settings.name,
             lon_deg=ds_input_points.lon.values,
             lat_deg=ds_input_points.lat.values,
             # level=self.healpix.refinement_level,  # assumes cell-point (level=29)
@@ -1313,7 +1318,9 @@ class NoChunkConverter(HealpixGroupConverter):
         # in case all arrays to resample have the same dtype
 
         log.debug("initialize resampler")
-        resampler = resampler_cls(
+        resampler = build_resampler(
+            resampler_cls,
+            resampler_settings.name,
             lon_deg=ds_input_points.lon.values,
             lat_deg=ds_input_points.lat.values,
             level=self.healpix.refinement_level,
