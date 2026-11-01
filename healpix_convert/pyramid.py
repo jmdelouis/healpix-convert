@@ -581,6 +581,43 @@ def create_derived_level_arrays(
         consolidated=False,
     )[0]
 
+    # creating an array is a few store round trips (about 0.5 s per array on
+    # object storage): the levels, then the staging arrays, are created in
+    # threads, so that these round trips overlap
+    def create_level(job):
+        level_path, ds, dim = job
+        # the variables on the cells are written by the chunk conversion
+        # tasks (their Dask graph is never computed), the others here
+        for var in ds.variables.values():
+            if dim not in var.dims:
+                var.load()
+        ds.to_zarr(
+            output_store,
+            group=level_path.as_posix(),
+            mode="a",
+            zarr_format=3,
+            consolidated=False,
+            compute=False,
+        )
+
+    def create_staging(job):
+        level_path, name, cells_per_chunk = job
+        array = zarr.open_array(
+            output_store, path=f"{level_path.as_posix()}/{name}", mode="r"
+        )
+        zarr.create_array(
+            output_store,
+            name=_staging_path(level_path, name),
+            shape=array.shape,
+            dtype=array.dtype,
+            chunks=(*array.shape[:-1], cells_per_chunk),
+            fill_value=array.fill_value,
+            dimension_names=array.metadata.dimension_names,
+            overwrite=True,
+        )
+
+    levels = []
+    staging = []
     for path in groups:
         info = cache.output_groups.pyramid_multiscale_groups[path]
         pyramid = settings.multiscale_settings.pyramid_groups[path]
@@ -592,39 +629,19 @@ def create_derived_level_arrays(
             healpix, _ = info.derived_levels[level_path]
             assert healpix.refinement_level is not None
             dim = healpix.spatial_dimension
-
-            # the variables on the cells are written by the chunk conversion
-            # tasks (their Dask graph is never computed), the others here
-            for var in ds.variables.values():
-                if dim not in var.dims:
-                    var.load()
-            ds.to_zarr(
-                output_store,
-                group=level_path.as_posix(),
-                mode="a",
-                zarr_format=3,
-                consolidated=False,
-                compute=False,
+            levels.append((level_path, ds, dim))
+            cells_per_chunk = 4 ** (healpix.refinement_level - chunk_level)
+            staging.extend(
+                (level_path, str(name), cells_per_chunk)
+                for name, var in ds.variables.items()
+                if dim in var.dims
             )
 
-            cells_per_chunk = 4 ** (healpix.refinement_level - chunk_level)
-            for name, var in ds.variables.items():
-                if dim not in var.dims:
-                    continue
-                array = zarr.open_array(
-                    output_store, path=f"{level_path.as_posix()}/{name}", mode="r"
-                )
-                zarr.create_array(
-                    output_store,
-                    name=_staging_path(level_path, str(name)),
-                    shape=array.shape,
-                    dtype=array.dtype,
-                    chunks=(*array.shape[:-1], cells_per_chunk),
-                    fill_value=array.fill_value,
-                    dimension_names=array.metadata.dimension_names,
-                    overwrite=True,
-                )
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        list(pool.map(create_level, levels))
+        list(pool.map(create_staging, staging))
 
+    for path in groups:
         log.info(
             f"••• created the derived level arrays of '{path.as_posix()}' "
             "(aggregated by the chunk conversion tasks)"
