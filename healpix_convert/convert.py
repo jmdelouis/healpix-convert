@@ -567,7 +567,9 @@ def _write_derived_levels_in_memory(
         # kept for the next datasets: starting the processes (importing
         # this package in each) costs more than a dataset's work
         _PYRAMID_POOL = ProcessPoolExecutor(
-            max_workers=os.cpu_count() or 1,
+            max_workers=int(
+                os.environ.get("HEALPIX_CONVERT_PYRAMID_PROCESSES", os.cpu_count() or 1)
+            ),
             mp_context=multiprocessing.get_context("spawn"),
         )
     with dask.config.set(scheduler="threads"):
