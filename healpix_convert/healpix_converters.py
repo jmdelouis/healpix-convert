@@ -971,8 +971,9 @@ class UniformChunkConverter(HealpixGroupConverter, ABC):
 
             x = ds_clipped.x.values
             y = ds_clipped.y.values
-            points = shapely.points(x, y)
-            in_poly = shapely.within(points, poly)
+            # same as shapely.within(shapely.points(x, y), poly) (a point on
+            # the boundary is not inside), without creating the point objects
+            in_poly = shapely.contains_xy(poly, x, y)
 
             if not in_poly.any():
                 # no pixel centre in the overlapping zone, e.g., the (buffered)
