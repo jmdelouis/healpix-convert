@@ -324,11 +324,49 @@ def create_transform_coords(
     )
 
 
+def _transform_on_device(
+    x: xr.DataArray, y: xr.DataArray, source_crs: pyproj.CRS, target_crs: pyproj.CRS
+) -> xr.Coordinates | None:
+    """With ``HEALPIX_CONVERT_DEVICE`` set, the lon/lat of a transverse
+    Mercator grid (e.g. UTM) to the geographic CRS of its datum, computed in
+    torch on that device (see :mod:`healpix_convert.core.tmerc`); else None."""
+    import os
+
+    device = os.environ.get("HEALPIX_CONVERT_DEVICE")
+    if not device or source_crs.geodetic_crs is None:
+        return None
+    if not target_crs.equals(source_crs.geodetic_crs, ignore_axis_order=True):
+        return None
+    from healpix_convert.core.tmerc import tmerc_inverse, tmerc_params
+
+    params = tmerc_params(source_crs)
+    if params is None:
+        return None
+    xx, yy = xr.broadcast(
+        x.drop_indexes("x", errors="ignore"),
+        y.drop_indexes("y", errors="ignore"),
+    )
+    lon, lat = tmerc_inverse(
+        xx.values.ravel(), yy.values.ravel(), device=device, **params
+    )
+    return xr.Coordinates(
+        {
+            "lon": xr.Variable(xx.dims, lon.reshape(xx.shape)),
+            "lat": xr.Variable(xx.dims, lat.reshape(xx.shape)),
+        },
+        indexes={},
+    )
+
+
 def assign_transform_coords(
     ds: xr.Dataset, source_crs: pyproj.CRS, target_crs: pyproj.CRS
 ) -> xr.Dataset:
-    transformer = pyproj.Transformer.from_crs(source_crs, target_crs, always_xy=True)
-    new_coords = create_transform_coords(ds["x"], ds["y"], transformer)
+    new_coords = _transform_on_device(ds["x"], ds["y"], source_crs, target_crs)
+    if new_coords is None:
+        transformer = pyproj.Transformer.from_crs(
+            source_crs, target_crs, always_xy=True
+        )
+        new_coords = create_transform_coords(ds["x"], ds["y"], transformer)
     return ds.assign_coords(new_coords)
 
 
