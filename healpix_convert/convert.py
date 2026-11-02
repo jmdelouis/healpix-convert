@@ -590,6 +590,11 @@ def _write_derived_levels_in_memory(
     }
     removed = [f"{root}/{key}" for key in before if key not in after]
     log.info(f"••• writing {len(changed)} objects of the derived levels at once...")
+    if not fs.async_impl:
+        # a local file system does not create the directories of the new
+        # arrays and levels (object stores have none)
+        for d in {k.rsplit("/", 1)[0] for k in changed}:
+            fs.makedirs(d, exist_ok=True)
     fs.pipe(changed)  # concurrent on async file systems
     if removed:
         fs.rm(removed)
