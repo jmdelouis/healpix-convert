@@ -40,7 +40,7 @@ from healpix_convert.core.metadata import (
     get_cf_grid_mapping_attrs,
     get_healpix_group_attrs,
 )
-from healpix_convert.resampler_cache import build_resampler
+from healpix_convert.resampler_cache import build_resampler, device_slot
 from healpix_convert.settings.common import (
     ConvertSettings,
     ExtraDimensionSettings,
@@ -1144,39 +1144,41 @@ class DenseChunkConverter(UniformChunkConverter):
             lat_deg = ds_input_points.lat.values
 
         log.debug("initialize resampler")
-        resampler = build_resampler(
-            resampler_cls,
-            resampler_settings.name,
-            lon_deg=lon_deg,
-            lat_deg=lat_deg,
-            level=self.healpix.refinement_level,
-            verbose=False,
-            out_cell_ids=out_cell_ids,
-            nest=self.healpix.indexing_scheme == "nested",
-            ellipsoid=self.healpix.ellipsoid.name,
-            **dict(resampler_settings.init_params),
-        )
-        if resampler is None:  # links-only pass (see resampler_cache.links_only)
-            return
-        # resample arrays (data variables)
-        var_names = [
-            str(name)
-            for name in ds_input_points.variables
-            if name in self.spatial_info.spatial_arrays
-        ]
-        resample_params = broadcast_params(
-            resampler_settings.resample_params, var_names
-        )
+        with device_slot():
+            resampler = build_resampler(
+                resampler_cls,
+                resampler_settings.name,
+                lon_deg=lon_deg,
+                lat_deg=lat_deg,
+                level=self.healpix.refinement_level,
+                verbose=False,
+                out_cell_ids=out_cell_ids,
+                nest=self.healpix.indexing_scheme == "nested",
+                ellipsoid=self.healpix.ellipsoid.name,
+                **dict(resampler_settings.init_params),
+            )
+            if resampler is None:  # links-only pass (see resampler_cache.links_only)
+                return
+            # resample arrays (data variables)
+            var_names = [
+                str(name)
+                for name in ds_input_points.variables
+                if name in self.spatial_info.spatial_arrays
+            ]
+            resample_params = broadcast_params(
+                resampler_settings.resample_params, var_names
+            )
 
-        log.debug(f"resample {len(var_names)} arrays")
-        resampled = _resample_variables(
-            resampler,
-            ds_input_points,
-            var_names,
-            resample_params,
-            chunk_cell_ids=cell_ids,
-            logger=log.bind(group=self.group_path, chunk_index=chunk_index),
-        )
+            log.debug(f"resample {len(var_names)} arrays")
+            resampled = _resample_variables(
+                resampler,
+                ds_input_points,
+                var_names,
+                resample_params,
+                chunk_cell_ids=cell_ids,
+                logger=log.bind(group=self.group_path, chunk_index=chunk_index),
+            )
+            del resampler
 
         writes = []
         for name, cell_data in resampled.items():
@@ -1235,45 +1237,47 @@ class SparseChunkConverter(UniformChunkConverter):
         # TODO: pass array dtype to resampler
         # in case all arrays to resample have the same dtype
 
-        resampler = build_resampler(
-            resampler_cls,
-            resampler_settings.name,
-            lon_deg=ds_input_points.lon.values,
-            lat_deg=ds_input_points.lat.values,
-            # level=self.healpix.refinement_level,  # assumes cell-point (level=29)
-            verbose=False,
-            nest=self.healpix.indexing_scheme == "nested",
-            ellipsoid=self.healpix.ellipsoid.name,
-            **dict(resampler_settings.init_params),
-        )
-        if resampler is None:  # links-only pass (see resampler_cache.links_only)
-            return
+        with device_slot():
+            resampler = build_resampler(
+                resampler_cls,
+                resampler_settings.name,
+                lon_deg=ds_input_points.lon.values,
+                lat_deg=ds_input_points.lat.values,
+                # level=self.healpix.refinement_level,  # assumes cell-point (level=29)
+                verbose=False,
+                nest=self.healpix.indexing_scheme == "nested",
+                ellipsoid=self.healpix.ellipsoid.name,
+                **dict(resampler_settings.init_params),
+            )
+            if resampler is None:  # links-only pass (see resampler_cache.links_only)
+                return
 
-        cell_ids = resampler.get_cell_ids()
-        start = chunk_index * self.cell_dim_chunk_size
-        stop = start + cell_ids.size
-        chunk_slice = slice(start, stop)
+            cell_ids = resampler.get_cell_ids()
+            start = chunk_index * self.cell_dim_chunk_size
+            stop = start + cell_ids.size
+            chunk_slice = slice(start, stop)
 
-        self.output_arrays[self.healpix.coordinate][chunk_slice] = cell_ids
+            self.output_arrays[self.healpix.coordinate][chunk_slice] = cell_ids
 
-        # resample arrays (data variables)
-        var_names = [
-            str(name)
-            for name in ds_input_points.variables
-            if name in self.spatial_info.spatial_arrays
-        ]
-        resample_params = broadcast_params(
-            resampler_settings.resample_params, var_names
-        )
+            # resample arrays (data variables)
+            var_names = [
+                str(name)
+                for name in ds_input_points.variables
+                if name in self.spatial_info.spatial_arrays
+            ]
+            resample_params = broadcast_params(
+                resampler_settings.resample_params, var_names
+            )
 
-        log.debug(f"resample {len(var_names)} arrays")
-        resampled = _resample_variables(
-            resampler,
-            ds_input_points,
-            var_names,
-            resample_params,
-            logger=log.bind(group=self.group_path, chunk_index=chunk_index),
-        )
+            log.debug(f"resample {len(var_names)} arrays")
+            resampled = _resample_variables(
+                resampler,
+                ds_input_points,
+                var_names,
+                resample_params,
+                logger=log.bind(group=self.group_path, chunk_index=chunk_index),
+            )
+            del resampler
 
         writes = []
         for name, cell_data in resampled.items():
@@ -1281,8 +1285,6 @@ class SparseChunkConverter(UniformChunkConverter):
             writes.append((zarray, (..., chunk_slice), cell_data.astype(zarray.dtype)))
 
         _write_chunk_arrays(writes)
-
-        del resampler
 
 
 class NoChunkConverter(HealpixGroupConverter):

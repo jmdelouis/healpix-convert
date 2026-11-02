@@ -26,6 +26,7 @@ skipped, the result is the same, bit for bit.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib.metadata
 import io
@@ -61,6 +62,53 @@ def default_device() -> str | None:
     resamplers that take one and whose settings set none. Unset: the defaults
     of healpix-resample."""
     return os.environ.get(DEVICE_ENV) or None
+
+
+GPU_SLOTS_ENV = "HEALPIX_CONVERT_GPU_SLOTS"
+
+
+@contextlib.contextmanager
+def device_slot():
+    """With ``HEALPIX_CONVERT_DEVICE`` and ``HEALPIX_CONVERT_GPU_SLOTS=n``
+    set: hold one of ``n`` slots of this machine (lock files in the temporary
+    directory, shared by its worker processes) while the resampler is built
+    and applied, then give the device memory of this process back. More
+    workers than slots can then read and write their chunks while others use
+    the device, without more of them on it at once than its memory holds.
+    Otherwise: nothing."""
+    slots = os.environ.get(GPU_SLOTS_ENV)
+    if default_device() is None or not slots:
+        yield
+        return
+    import fcntl
+    import time
+
+    files = [
+        open(os.path.join(tempfile.gettempdir(), f"healpix-convert-device-slot-{i}.lock"), "a")
+        for i in range(int(slots))
+    ]
+    held = None
+    try:
+        while held is None:
+            for f in files:
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    held = f
+                    break
+                except BlockingIOError:
+                    pass
+            else:
+                time.sleep(0.02)
+        yield
+    finally:
+        if held is not None:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            fcntl.flock(held, fcntl.LOCK_UN)
+        for f in files:
+            f.close()
 
 
 def _with_device(resampler_cls: type, kwargs: dict[str, Any]) -> dict[str, Any]:

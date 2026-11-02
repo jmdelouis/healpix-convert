@@ -349,6 +349,12 @@ def _transform_on_device(
     lon, lat = tmerc_inverse(
         xx.values.ravel(), yy.values.ravel(), device=device, **params
     )
+    if device.startswith("cuda"):
+        import torch
+
+        # outside the device slots (see resampler_cache.device_slot): give
+        # the memory back to the other processes on the device
+        torch.cuda.empty_cache()
     return xr.Coordinates(
         {
             "lon": xr.Variable(xx.dims, lon.reshape(xx.shape)),
