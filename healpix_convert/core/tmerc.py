@@ -2,9 +2,9 @@
 
 The "exact" algorithm of PROJ (Poder/Engsager, Krueger series of order 6,
 PROJ ``src/projections/tmerc.cpp``), with PROJ's order of operations, so the
-coordinates of projected inputs can be computed on the GPU. On a 10 m
-Sentinel-2 grid the results differ from pyproj's by a few units in the last
-place (at most 3e-14 degree, a few nanometres), from the math libraries.
+coordinates of projected inputs can be computed on the GPU. On a UTM grid
+the results differ from pyproj's by a few units in the last place (at most
+3e-14 degree, a few nanometres), from the math libraries.
 """
 import math
 
