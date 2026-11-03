@@ -1,6 +1,6 @@
 """Reuse of the resamplers between groups.
 
-The groups on a same input grid (e.g. the Sentinel-2 10 m masks) build, for a
+The groups on a same input grid (e.g. several masks of one product) build, for a
 given output chunk, the same resampler: same input points, same output cells,
 same method and parameters. Building it (the neighbour search) is most of the
 cost of a "nearest" group.
